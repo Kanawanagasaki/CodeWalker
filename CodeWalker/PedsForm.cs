@@ -1,4 +1,5 @@
-﻿using CodeWalker.GameFiles;
+﻿using CodeWalker.Export;
+using CodeWalker.GameFiles;
 using CodeWalker.Properties;
 using CodeWalker.Rendering;
 using CodeWalker.World;
@@ -1627,6 +1628,39 @@ namespace CodeWalker
         private void EnableRootMotionCheckBox_CheckedChanged(object sender, EventArgs e)
         {
             SelectedPed.EnableRootMotion = EnableRootMotionCheckBox.Checked;
+        }
+
+        private void ExportGltfButton_Click(object sender, EventArgs e)
+        {
+            if (SelectedPed.Yft == null)
+            {
+                MessageBox.Show("No ped loaded. Please select a ped first.", "Export Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            using (var sfd = new SaveFileDialog())
+            {
+                sfd.Title = "Export Ped as glTF/GLB";
+                sfd.FileName = (SelectedPed.Name ?? "ped") + ".glb";
+                sfd.Filter = "GLB Binary glTF|*.glb|glTF (embedded)|*.gltf|All files|*.*";
+                sfd.DefaultExt = "glb";
+                sfd.AddExtension = true;
+
+                if (sfd.ShowDialog() != DialogResult.OK) return;
+
+                try
+                {
+                    PedGltfExporter.Export(SelectedPed, sfd.FileName);
+                    MessageBox.Show("Export completed successfully!\n\nFile: " + sfd.FileName,
+                        "Export Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Export failed:\n\n" + ex.Message + "\n\n" + ex.StackTrace,
+                        "Export Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
         }
     }
 }

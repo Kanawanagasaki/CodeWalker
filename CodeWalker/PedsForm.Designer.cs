@@ -76,6 +76,7 @@
             this.PedNameComboBox = new System.Windows.Forms.ComboBox();
             this.StatsUpdateTimer = new System.Windows.Forms.Timer(this.components);
             this.ToolsPedTabPage = new System.Windows.Forms.TabPage();
+            this.ExportGltfButton = new System.Windows.Forms.Button();
             this.EnableRootMotionCheckBox = new System.Windows.Forms.CheckBox();
             this.label23 = new System.Windows.Forms.Label();
             this.label22 = new System.Windows.Forms.Label();
@@ -657,6 +658,7 @@
             // 
             // ToolsPedTabPage
             // 
+            this.ToolsPedTabPage.Controls.Add(this.ExportGltfButton);
             this.ToolsPedTabPage.Controls.Add(this.EnableRootMotionCheckBox);
             this.ToolsPedTabPage.Controls.Add(this.label23);
             this.ToolsPedTabPage.Controls.Add(this.label22);
@@ -696,7 +698,17 @@
             this.ToolsPedTabPage.TabIndex = 4;
             this.ToolsPedTabPage.Text = "Ped";
             this.ToolsPedTabPage.UseVisualStyleBackColor = true;
-            // 
+            //
+            // ExportGltfButton
+            //
+            this.ExportGltfButton.Location = new System.Drawing.Point(54, 530);
+            this.ExportGltfButton.Name = "ExportGltfButton";
+            this.ExportGltfButton.Size = new System.Drawing.Size(182, 28);
+            this.ExportGltfButton.TabIndex = 33;
+            this.ExportGltfButton.Text = "Export as glTF/GLB...";
+            this.ExportGltfButton.UseVisualStyleBackColor = true;
+            this.ExportGltfButton.Click += new System.EventHandler(this.ExportGltfButton_Click);
+            //
             // EnableRootMotionCheckBox
             // 
             this.EnableRootMotionCheckBox.AutoSize = true;
@@ -1196,6 +1208,7 @@
         private System.Windows.Forms.Label label21;
         private System.Windows.Forms.ComboBox ClipDictComboBox;
         private System.Windows.Forms.Label label23;
+        private System.Windows.Forms.Button ExportGltfButton;
         private System.Windows.Forms.CheckBox EnableRootMotionCheckBox;
     }
 }
