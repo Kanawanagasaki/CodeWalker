@@ -2,6 +2,7 @@
   "profiles": {
     "CodeWalker": {
       "commandName": "Project",
+      "commandLineArgs": "peds",
       "workingDirectory": ".."
     }
   }

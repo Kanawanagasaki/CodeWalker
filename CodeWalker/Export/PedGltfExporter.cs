@@ -1221,7 +1221,7 @@ namespace CodeWalker.Export
 
                 using (var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
-                    var bd = bmp.LockBits(new Rectangle(0, 0, width, height),
+                    var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, width, height),
                         ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
                     // DDSIO.GetPixels returns RGBA bytes, but Format32bppArgb expects BGRA in memory.
                     // We need to swap R and B channels.
