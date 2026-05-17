@@ -165,6 +165,7 @@ namespace CodeWalker.Export
             public List<GltfScene> Scenes = new List<GltfScene>();
 
             public Dictionary<int, int> BoneToNode = new Dictionary<int, int>();
+            public Dictionary<ushort, int> BoneTagToNode = new Dictionary<ushort, int>();
             public int RootNodeIndex = -1;
             public int PedRootNodeIndex = -1;
             public Dictionary<MetaHash, int> TextureToGltfIndex = new Dictionary<MetaHash, int>();
@@ -276,6 +277,7 @@ namespace CodeWalker.Export
                 int nodeIdx = ctx.Nodes.Count;
                 ctx.Nodes.Add(node);
                 ctx.BoneToNode[i] = nodeIdx;
+                ctx.BoneTagToNode[bone.Tag] = nodeIdx;
                 ctx.NodeChildren[nodeIdx] = new List<int>();
             }
 
@@ -301,33 +303,37 @@ namespace CodeWalker.Export
             // we guarantee that IBM * GlobalTransform = Identity at bind pose.
             // This avoids subtle mismatches between CodeWalker's ScaleVector*= diagonal-only
             // scaling and glTF's standard T*R*S column scaling.
-            var globalTransforms = new Matrix[bones.Length];
+
+            // Pre-compute local transforms for all bones first.
+            var localTransforms = new Matrix[bones.Length];
             for (int i = 0; i < bones.Length; i++)
             {
                 var bone = bones[i];
-                // glTF-space TRS values (same conversion as the node properties above)
                 Vector3 t_gltf = new Vector3(bone.Translation.X, bone.Translation.Z, -bone.Translation.Y);
                 Quaternion r_gltf = new Quaternion(bone.Rotation.X, bone.Rotation.Z, -bone.Rotation.Y, bone.Rotation.W);
                 Vector3 s_gltf = new Vector3(bone.Scale.X, bone.Scale.Z, bone.Scale.Y);
-                // Local transform: M_local = S * R * T (row-vector convention)
-                // This is the row-vector equivalent of glTF's column-vector T * R * S.
-                Matrix M_local = Matrix.Scaling(s_gltf) * Matrix.RotationQuaternion(r_gltf) * Matrix.Translation(t_gltf);
-                // Accumulate with parent's global transform
-                if (bone.ParentIndex >= 0 && bone.ParentIndex < bones.Length && bone.ParentIndex != i)
-                    globalTransforms[i] = M_local * globalTransforms[bone.ParentIndex];
-                else
-                    globalTransforms[i] = M_local;
+                localTransforms[i] = Matrix.Scaling(s_gltf) * Matrix.RotationQuaternion(r_gltf) * Matrix.Translation(t_gltf);
             }
+
+            // Compute global transforms with proper parent-before-child ordering.
+            // GTA V ped bones are often stored in non-hierarchical order (children before parents),
+            // so we must recursively ensure the parent's global transform is computed first.
+            var globalTransforms = new Matrix[bones.Length];
+            var globalComputed = new bool[bones.Length];
+            for (int i = 0; i < bones.Length; i++)
+                ComputeGlobalTransform(i, bones, localTransforms, globalTransforms, globalComputed);
 
             var ibmFloats = new List<float>();
             for (int i = 0; i < bones.Length; i++)
             {
                 Matrix ibm = Matrix.Invert(globalTransforms[i]);
-                // Store in column-major order as required by glTF
-                ibmFloats.Add(ibm.M11); ibmFloats.Add(ibm.M21); ibmFloats.Add(ibm.M31); ibmFloats.Add(ibm.M41);
-                ibmFloats.Add(ibm.M12); ibmFloats.Add(ibm.M22); ibmFloats.Add(ibm.M32); ibmFloats.Add(ibm.M42);
-                ibmFloats.Add(ibm.M13); ibmFloats.Add(ibm.M23); ibmFloats.Add(ibm.M33); ibmFloats.Add(ibm.M43);
-                ibmFloats.Add(ibm.M14); ibmFloats.Add(ibm.M24); ibmFloats.Add(ibm.M34); ibmFloats.Add(ibm.M44);
+                // SharpDX uses row-vector convention (v*M), glTF uses column-vector (M*v).
+                // To convert: transpose the matrix, then store column-major.
+                // Transpose + column-major = row-major of the original = row-by-row reading.
+                ibmFloats.Add(ibm.M11); ibmFloats.Add(ibm.M12); ibmFloats.Add(ibm.M13); ibmFloats.Add(ibm.M14);
+                ibmFloats.Add(ibm.M21); ibmFloats.Add(ibm.M22); ibmFloats.Add(ibm.M23); ibmFloats.Add(ibm.M24);
+                ibmFloats.Add(ibm.M31); ibmFloats.Add(ibm.M32); ibmFloats.Add(ibm.M33); ibmFloats.Add(ibm.M34);
+                ibmFloats.Add(ibm.M41); ibmFloats.Add(ibm.M42); ibmFloats.Add(ibm.M43); ibmFloats.Add(ibm.M44);
             }
             byte[] ibmBytes = new byte[ibmFloats.Count * 4];
             Buffer.BlockCopy(ibmFloats.ToArray(), 0, ibmBytes, 0, ibmBytes.Length);
@@ -343,6 +349,28 @@ namespace CodeWalker.Export
             for (int i = 0; i < bones.Length; i++)
                 skin.joints.Add(ctx.BoneToNode[i]);
             ctx.Skins.Add(skin);
+        }
+
+        /// <summary>
+        /// Recursively compute the global transform for bone at index i,
+        /// ensuring the parent's global transform is computed first.
+        /// This handles GTA V ped skeletons where bones are not stored in
+        /// parent-before-child order.
+        /// </summary>
+        static void ComputeGlobalTransform(int i, Bone[] bones, Matrix[] localTransforms, Matrix[] globalTransforms, bool[] globalComputed)
+        {
+            if (globalComputed[i]) return;
+            var bone = bones[i];
+            if (bone.ParentIndex >= 0 && bone.ParentIndex < bones.Length && bone.ParentIndex != i)
+            {
+                ComputeGlobalTransform(bone.ParentIndex, bones, localTransforms, globalTransforms, globalComputed);
+                globalTransforms[i] = localTransforms[i] * globalTransforms[bone.ParentIndex];
+            }
+            else
+            {
+                globalTransforms[i] = localTransforms[i];
+            }
+            globalComputed[i] = true;
         }
 
         /// <summary>
@@ -874,8 +902,10 @@ namespace CodeWalker.Export
             for (int bi = 0; bi < boneIds.Length; bi++)
             {
                 var boneId = boneIds[bi];
-                if (!skeleton.BonesMap.TryGetValue(boneId.BoneId, out var bone)) continue;
-                if (!ctx.BoneToNode.TryGetValue(bone.Index, out int nodeIdx)) continue;
+                // Look up the glTF node by bone tag (BoneId = bone.Tag).
+                // Do NOT use bone.Index since BoneToNode is keyed by array position,
+                // and bone.Index can differ from array position in GTA V ped skeletons.
+                if (!ctx.BoneTagToNode.TryGetValue(boneId.BoneId, out int nodeIdx)) continue;
 
                 if (boneId.Track == 0) // Translation
                 {
