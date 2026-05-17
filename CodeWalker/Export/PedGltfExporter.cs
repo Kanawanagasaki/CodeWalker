@@ -296,15 +296,38 @@ namespace CodeWalker.Export
                 }
             }
 
-            // Inverse bind matrices: convert from GTA space to glTF space.
-            // bone.BindTransformInv is the inverse of the world rest pose in GTA LH space.
-            // The correct conversion is: M_gltf = P * M_gta^T * P^T (row-vector to column-vector,
-            // with axis swap), which for a SharpDX row-major matrix M produces column-major output:
-            // Col i: (M11,M13,-M12,M14), (M31,M33,-M32,M34), (-M21,-M23,M22,-M24), (M41,M43,-M42,M44)
+            // Inverse bind matrices: computed from the glTF TRS hierarchy.
+            // By building the IBM from the same TRS values that glTF uses for node transforms,
+            // we guarantee that IBM * GlobalTransform = Identity at bind pose.
+            // This avoids subtle mismatches between CodeWalker's ScaleVector*= diagonal-only
+            // scaling and glTF's standard T*R*S column scaling.
+            var globalTransforms = new Matrix[bones.Length];
+            for (int i = 0; i < bones.Length; i++)
+            {
+                var bone = bones[i];
+                // glTF-space TRS values (same conversion as the node properties above)
+                Vector3 t_gltf = new Vector3(bone.Translation.X, bone.Translation.Z, -bone.Translation.Y);
+                Quaternion r_gltf = new Quaternion(bone.Rotation.X, bone.Rotation.Z, -bone.Rotation.Y, bone.Rotation.W);
+                Vector3 s_gltf = new Vector3(bone.Scale.X, bone.Scale.Z, bone.Scale.Y);
+                // Local transform: M_local = S * R * T (row-vector convention)
+                // This is the row-vector equivalent of glTF's column-vector T * R * S.
+                Matrix M_local = Matrix.Scaling(s_gltf) * Matrix.RotationQuaternion(r_gltf) * Matrix.Translation(t_gltf);
+                // Accumulate with parent's global transform
+                if (bone.ParentIndex >= 0 && bone.ParentIndex < bones.Length && bone.ParentIndex != i)
+                    globalTransforms[i] = M_local * globalTransforms[bone.ParentIndex];
+                else
+                    globalTransforms[i] = M_local;
+            }
+
             var ibmFloats = new List<float>();
             for (int i = 0; i < bones.Length; i++)
             {
-                ibmFloats.AddRange(ConvertMatrixToGltf(bones[i].BindTransformInv));
+                Matrix ibm = Matrix.Invert(globalTransforms[i]);
+                // Store in column-major order as required by glTF
+                ibmFloats.Add(ibm.M11); ibmFloats.Add(ibm.M21); ibmFloats.Add(ibm.M31); ibmFloats.Add(ibm.M41);
+                ibmFloats.Add(ibm.M12); ibmFloats.Add(ibm.M22); ibmFloats.Add(ibm.M32); ibmFloats.Add(ibm.M42);
+                ibmFloats.Add(ibm.M13); ibmFloats.Add(ibm.M23); ibmFloats.Add(ibm.M33); ibmFloats.Add(ibm.M43);
+                ibmFloats.Add(ibm.M14); ibmFloats.Add(ibm.M24); ibmFloats.Add(ibm.M34); ibmFloats.Add(ibm.M44);
             }
             byte[] ibmBytes = new byte[ibmFloats.Count * 4];
             Buffer.BlockCopy(ibmFloats.ToArray(), 0, ibmBytes, 0, ibmBytes.Length);
@@ -535,6 +558,10 @@ namespace CodeWalker.Export
                                     HalfHelper.HalfToSingle(vbytes[bwo + 6], vbytes[bwo + 7]));
                             break;
                         case VertexComponentType.UByte4:
+                        case VertexComponentType.Colour:
+                            // Both UByte4 and Colour are 4 bytes (R8G8B8A8_UNORM).
+                            // Each byte is a normalized weight [0-255] → [0.0-1.0].
+                            // Read raw bytes directly to avoid Color struct byte shuffling.
                             if (bwo + 4 <= vbytes.Length)
                                 bw = new Vector4(
                                     vbytes[bwo] / 255.0f,
@@ -543,8 +570,13 @@ namespace CodeWalker.Export
                                     vbytes[bwo + 3] / 255.0f);
                             break;
                         default:
-                            // Fallback: try GetVector4
-                            try { bw = vdata.GetVector4(v, 1); } catch { }
+                            // Fallback: try reading 4 raw bytes for unknown types
+                            if (bwo + 4 <= vbytes.Length)
+                                bw = new Vector4(
+                                    vbytes[bwo] / 255.0f,
+                                    vbytes[bwo + 1] / 255.0f,
+                                    vbytes[bwo + 2] / 255.0f,
+                                    vbytes[bwo + 3] / 255.0f);
                             break;
                     }
 
@@ -1085,7 +1117,7 @@ namespace CodeWalker.Export
                     var s = ctx.Samplers[i];
                     sb.Append("{\"magFilter\":"); sb.Append(s.magFilter);
                     sb.Append(",\"minFilter\":"); sb.Append(s.minFilter);
-                    sb.Append(",\"wrapS\":"); s.wrapS.ToString(); sb.Append(s.wrapS);
+                    sb.Append(",\"wrapS\":"); sb.Append(s.wrapS);
                     sb.Append(",\"wrapT\":"); sb.Append(s.wrapT);
                     sb.Append("}");
                 }
