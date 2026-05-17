@@ -4,9 +4,12 @@ using CodeWalker.World;
 using SharpDX;
 using System;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace CodeWalker.Export
@@ -20,7 +23,7 @@ namespace CodeWalker.Export
 
         class GltfScene
         {
-            public string name;
+            public string name = "";
             public List<int> nodes = new List<int>();
         }
 
@@ -43,8 +46,8 @@ namespace CodeWalker.Export
         class GltfMeshPrimitive
         {
             public Dictionary<string, int> attributes = new Dictionary<string, int>();
-            public int? indices;
-            public int? material;
+            public int? indices = null;
+            public int? material = null;
         }
 
         class GltfSkin
@@ -402,6 +405,9 @@ namespace CodeWalker.Export
             int vertCount = vdata.VertexCount;
             if (vertCount <= 0) return null;
 
+            // Create the primitive object at the start so it can be used throughout
+            var prim = new GltfMeshPrimitive();
+
             bool hasSkin = model.HasSkin > 0;
             ushort[] geomBoneIds = geom.BoneIds;
 
@@ -603,11 +609,12 @@ namespace CodeWalker.Export
 
         static ushort RemapBoneIndex(byte localIdx, ushort[] geomBoneIds, Skeleton skeleton)
         {
+            // geom.BoneIds[] maps vertex local bone indices to skeleton bone array indices.
+            // The values ARE direct skeleton bone indices (not bone tags/hashes).
+            // This is confirmed by Renderable.UpdateBoneTransforms which does:
+            //   var id = boneids[b]; geom.BoneTransforms[b] = bonetransforms[id];
             if (geomBoneIds == null || localIdx >= geomBoneIds.Length) return 0;
-            ushort boneTag = geomBoneIds[localIdx];
-            if (skeleton?.BonesMap != null && skeleton.BonesMap.TryGetValue(boneTag, out var bone))
-                return (ushort)bone.Index;
-            return localIdx;
+            return geomBoneIds[localIdx];
         }
 
         /// <summary>
@@ -1099,7 +1106,7 @@ namespace CodeWalker.Export
             sb.Append("],");
 
             // Buffers
-            sb.Append("\"buffers\":[{\"byteLength\":"); sb.Append(ctx.BufferData.Count);
+            sb.Append("\"buffers\":[{\"byteLength\":"); sb.Append((uint)ctx.BufferData.Count);
             if (bufferUri != null) { sb.Append(",\"uri\":"); sb.Append(JsonStr(bufferUri)); }
             sb.Append("}]");
 
@@ -1206,94 +1213,40 @@ namespace CodeWalker.Export
 
         static byte[] EncodePng(byte[] rgbaPixels, int width, int height)
         {
-            if (rgbaPixels == null || rgbaPixels.Length < width * height * 4) return null;
-
-            using (var ms = new MemoryStream())
+            // Use System.Drawing.Bitmap for reliable PNG encoding from RGBA pixel data.
+            // The previous custom PNG encoder produced broken output (pink textures).
+            try
             {
-                // PNG signature
-                ms.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
+                if (rgbaPixels == null || rgbaPixels.Length < width * height * 4) return null;
 
-                // IHDR chunk
-                byte[] ihdr = new byte[13];
-                WriteBE32(ihdr, 0, width); WriteBE32(ihdr, 4, height);
-                ihdr[8] = 8;  // bit depth
-                ihdr[9] = 6;  // color type: RGBA
-                ihdr[10] = 0; // compression
-                ihdr[11] = 0; // filter
-                ihdr[12] = 0; // interlace
-                WriteChunk(ms, 0x49484452, ihdr);
-
-                // IDAT chunk(s) - raw pixel data with filter byte per row
-                using (var rawMs = new MemoryStream())
+                using (var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
-                    for (int y = 0; y < height; y++)
+                    var bd = bmp.LockBits(new Rectangle(0, 0, width, height),
+                        ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                    // DDSIO.GetPixels returns RGBA bytes, but Format32bppArgb expects BGRA in memory.
+                    // We need to swap R and B channels.
+                    int pixelCount = width * height;
+                    var bgraPixels = new byte[pixelCount * 4];
+                    for (int i = 0; i < pixelCount; i++)
                     {
-                        rawMs.WriteByte(0); // None filter
-                        int rowStart = y * width * 4;
-                        rawMs.Write(rgbaPixels, rowStart, width * 4);
+                        bgraPixels[i * 4 + 0] = rgbaPixels[i * 4 + 2]; // B = R
+                        bgraPixels[i * 4 + 1] = rgbaPixels[i * 4 + 1]; // G = G
+                        bgraPixels[i * 4 + 2] = rgbaPixels[i * 4 + 0]; // R = B
+                        bgraPixels[i * 4 + 3] = rgbaPixels[i * 4 + 3]; // A = A
                     }
-                    byte[] rawBytes = rawMs.ToArray();
-
-                    // Compress with Deflate
-                    using (var compressedMs = new MemoryStream())
+                    Marshal.Copy(bgraPixels, 0, bd.Scan0, bgraPixels.Length);
+                    bmp.UnlockBits(bd);
+                    using (var ms = new MemoryStream())
                     {
-                        using (var ds = new DeflateStream(compressedMs, CompressionLevel.Optimal, true))
-                        {
-                            ds.Write(rawBytes, 0, rawBytes.Length);
-                        }
-                        WriteChunk(ms, 0x49444154, compressedMs.ToArray());
+                        bmp.Save(ms, ImageFormat.Png);
+                        return ms.ToArray();
                     }
                 }
-
-                // IEND chunk
-                WriteChunk(ms, 0x49454E44, new byte[0]);
-
-                return ms.ToArray();
             }
-        }
-
-        static void WriteChunk(Stream ms, uint type, byte[] data)
-        {
-            byte[] lenBytes = new byte[4];
-            WriteBE32(lenBytes, 0, data.Length);
-            ms.Write(lenBytes, 0, 4);
-
-            byte[] typeBytes = new byte[4];
-            typeBytes[0] = (byte)(type >> 24);
-            typeBytes[1] = (byte)(type >> 16);
-            typeBytes[2] = (byte)(type >> 8);
-            typeBytes[3] = (byte)(type);
-            ms.Write(typeBytes, 0, 4);
-
-            ms.Write(data, 0, data.Length);
-
-            // CRC32 over type + data
-            uint crc = Crc32(typeBytes, 0, 4);
-            crc = Crc32(data, 0, data.Length, crc);
-            byte[] crcBytes = new byte[4];
-            WriteBE32(crcBytes, 0, (int)crc);
-            ms.Write(crcBytes, 0, 4);
-        }
-
-        static void WriteBE32(byte[] buf, int offset, int value)
-        {
-            buf[offset] = (byte)(value >> 24);
-            buf[offset + 1] = (byte)(value >> 16);
-            buf[offset + 2] = (byte)(value >> 8);
-            buf[offset + 3] = (byte)(value);
-        }
-
-        static uint Crc32(byte[] data, int offset, int length, uint crc = 0xFFFFFFFF)
-        {
-            for (int i = offset; i < offset + length; i++)
+            catch
             {
-                crc ^= data[i];
-                for (int j = 0; j < 8; j++)
-                {
-                    crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
-                }
+                return null;
             }
-            return ~crc;
         }
 
         #endregion
