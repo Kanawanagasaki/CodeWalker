@@ -1,4 +1,5 @@
 using CodeWalker.GameFiles;
+using CodeWalker.Utils;
 using CodeWalker.World;
 using SharpDX;
 using System;
@@ -390,23 +391,38 @@ namespace CodeWalker.Export
 
         static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton)
         {
-            var vdata = geom.VertexBuffer?.Data1;
+            // Use geom.VertexData which resolves Data1 ?? Data2 automatically
+            var vdata = geom.VertexData;
             if (vdata == null) return null;
+            var decl = vdata.Info;
+            if (decl == null) return null;
 
-            var prim = new GltfMeshPrimitive();
-            int vertCount = (int)geom.VerticesCount;
+            // Use VertexData.VertexCount as the authoritative vertex count
+            // (geom.VerticesCount is a ushort that can overflow or be stale)
+            int vertCount = vdata.VertexCount;
+            if (vertCount <= 0) return null;
+
             bool hasSkin = model.HasSkin > 0;
             ushort[] geomBoneIds = geom.BoneIds;
-            var decl = vdata.Info;
 
-            bool hasNormals = false, hasTexCoords = false, hasBlendData = false;
-            if (decl != null)
-            {
-                uint flags = decl.Flags;
-                hasNormals = ((flags >> 3) & 1) == 1;
-                hasTexCoords = ((flags >> 6) & 1) == 1;
-                hasBlendData = ((flags >> 1) & 1) == 1 && ((flags >> 2) & 1) == 1;
-            }
+            uint flags = decl.Flags;
+            bool hasNormals = ((flags >> 3) & 1) == 1;
+            bool hasTexCoords = ((flags >> 6) & 1) == 1;
+            bool hasBlendWeights = ((flags >> 1) & 1) == 1;
+            bool hasBlendIndices = ((flags >> 2) & 1) == 1;
+            bool hasBlendData = hasBlendWeights && hasBlendIndices;
+
+            // Precompute component offsets for direct byte access
+            int stride = decl.Stride;
+            int posOffset = decl.GetComponentOffset(0);
+            int nrmOffset = hasNormals ? decl.GetComponentOffset(3) : -1;
+            int uvOffset = hasTexCoords ? decl.GetComponentOffset(6) : -1;
+            int bwOffset = hasBlendWeights ? decl.GetComponentOffset(1) : -1;
+            int biOffset = hasBlendIndices ? decl.GetComponentOffset(2) : -1;
+
+            // Get the blend weight component type to handle different encodings
+            VertexComponentType bwType = hasBlendWeights ? decl.GetComponentType(1) : VertexComponentType.Nothing;
+            VertexComponentType biType = hasBlendIndices ? decl.GetComponentType(2) : VertexComponentType.Nothing;
 
             var positions = new List<float>();
             var normals = new List<float>();
@@ -416,46 +432,123 @@ namespace CodeWalker.Export
             float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
             float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
 
+            var vbytes = vdata.VertexBytes;
+
             for (int v = 0; v < vertCount; v++)
             {
+                int baseOff = v * stride;
+
+                // Position (always Float3 at semantic 0)
                 Vector3 pos = Vector3.Zero;
-                try { pos = vdata.GetVector3(v, 0); } catch { }
+                int po = baseOff + posOffset;
+                if (po + 12 <= vbytes.Length)
+                {
+                    pos = new Vector3(
+                        BitConverter.ToSingle(vbytes, po),
+                        BitConverter.ToSingle(vbytes, po + 4),
+                        BitConverter.ToSingle(vbytes, po + 8));
+                }
+                // GTA V is left-handed Y-up, glTF is right-handed Y-up
+                // Conversion: glTF_X = GTA_X, glTF_Y = GTA_Z, glTF_Z = -GTA_Y
                 float px = pos.X, py = pos.Z, pz = -pos.Y;
                 positions.Add(px); positions.Add(py); positions.Add(pz);
                 if (px < minX) minX = px; if (py < minY) minY = py; if (pz < minZ) minZ = pz;
                 if (px > maxX) maxX = px; if (py > maxY) maxY = py; if (pz > maxZ) maxZ = pz;
 
+                // Normal (Float3 at semantic 3)
                 if (hasNormals)
                 {
                     Vector3 nrm = Vector3.UnitZ;
-                    try { nrm = vdata.GetVector3(v, 3); } catch { }
+                    int no = baseOff + nrmOffset;
+                    if (no + 12 <= vbytes.Length)
+                    {
+                        nrm = new Vector3(
+                            BitConverter.ToSingle(vbytes, no),
+                            BitConverter.ToSingle(vbytes, no + 4),
+                            BitConverter.ToSingle(vbytes, no + 8));
+                    }
                     normals.Add(nrm.X); normals.Add(nrm.Z); normals.Add(-nrm.Y);
                 }
+
+                // TexCoord0 (Float2 at semantic 6)
                 if (hasTexCoords)
                 {
                     Vector2 uv = Vector2.Zero;
-                    try { uv = vdata.GetVector2(v, 6); } catch { }
-                    texcoords.Add(uv.X); texcoords.Add(-uv.Y);
+                    int uo = baseOff + uvOffset;
+                    if (uo + 8 <= vbytes.Length)
+                    {
+                        uv = new Vector2(
+                            BitConverter.ToSingle(vbytes, uo),
+                            BitConverter.ToSingle(vbytes, uo + 4));
+                    }
+                    // Flip V for OpenGL/glTF convention (V=0 at bottom)
+                    texcoords.Add(uv.X); texcoords.Add(1.0f - uv.Y);
                 }
+
+                // Blend weights and indices (skinning data)
                 if (hasBlendData && hasSkin)
                 {
+                    // Read blend weights - handle different component types
                     Vector4 bw = Vector4.Zero;
-                    try { bw = vdata.GetVector4(v, 1); } catch { }
+                    int bwo = baseOff + bwOffset;
+                    switch (bwType)
+                    {
+                        case VertexComponentType.Float4:
+                            if (bwo + 16 <= vbytes.Length)
+                                bw = new Vector4(
+                                    BitConverter.ToSingle(vbytes, bwo),
+                                    BitConverter.ToSingle(vbytes, bwo + 4),
+                                    BitConverter.ToSingle(vbytes, bwo + 8),
+                                    BitConverter.ToSingle(vbytes, bwo + 12));
+                            break;
+                        case VertexComponentType.Half4:
+                            if (bwo + 8 <= vbytes.Length)
+                                bw = new Vector4(
+                                    HalfHelper.HalfToSingle(vbytes[bwo], vbytes[bwo + 1]),
+                                    HalfHelper.HalfToSingle(vbytes[bwo + 2], vbytes[bwo + 3]),
+                                    HalfHelper.HalfToSingle(vbytes[bwo + 4], vbytes[bwo + 5]),
+                                    HalfHelper.HalfToSingle(vbytes[bwo + 6], vbytes[bwo + 7]));
+                            break;
+                        case VertexComponentType.UByte4:
+                            if (bwo + 4 <= vbytes.Length)
+                                bw = new Vector4(
+                                    vbytes[bwo] / 255.0f,
+                                    vbytes[bwo + 1] / 255.0f,
+                                    vbytes[bwo + 2] / 255.0f,
+                                    vbytes[bwo + 3] / 255.0f);
+                            break;
+                        default:
+                            // Fallback: try GetVector4
+                            try { bw = vdata.GetVector4(v, 1); } catch { }
+                            break;
+                    }
+
+                    // Normalize blend weights so they sum to 1.0
                     float tw = bw.X + bw.Y + bw.Z + bw.W;
                     if (tw > 0.001f) { bw.X /= tw; bw.Y /= tw; bw.Z /= tw; bw.W /= tw; }
                     else { bw.X = 1f; bw.Y = 0f; bw.Z = 0f; bw.W = 0f; }
                     blendWeights.Add(bw.X); blendWeights.Add(bw.Y); blendWeights.Add(bw.Z); blendWeights.Add(bw.W);
 
-                    uint bi = 0;
-                    try { bi = vdata.GetColour(v, 2); } catch { }
-                    blendJoints.Add(RemapBoneIndex((byte)(bi & 0xFF), geomBoneIds, skeleton));
-                    blendJoints.Add(RemapBoneIndex((byte)((bi >> 8) & 0xFF), geomBoneIds, skeleton));
-                    blendJoints.Add(RemapBoneIndex((byte)((bi >> 16) & 0xFF), geomBoneIds, skeleton));
-                    blendJoints.Add(RemapBoneIndex((byte)((bi >> 24) & 0xFF), geomBoneIds, skeleton));
+                    // Read blend indices directly from raw bytes to avoid Color struct byte shuffling
+                    // These 4 bytes are local bone indices into geom.BoneIds[]
+                    byte bi0 = 0, bi1 = 0, bi2 = 0, bi3 = 0;
+                    int bio = baseOff + biOffset;
+                    if (bio + 4 <= vbytes.Length)
+                    {
+                        bi0 = vbytes[bio];
+                        bi1 = vbytes[bio + 1];
+                        bi2 = vbytes[bio + 2];
+                        bi3 = vbytes[bio + 3];
+                    }
+                    // Remap local bone indices to global skeleton bone indices
+                    blendJoints.Add(RemapBoneIndex(bi0, geomBoneIds, skeleton));
+                    blendJoints.Add(RemapBoneIndex(bi1, geomBoneIds, skeleton));
+                    blendJoints.Add(RemapBoneIndex(bi2, geomBoneIds, skeleton));
+                    blendJoints.Add(RemapBoneIndex(bi3, geomBoneIds, skeleton));
                 }
             }
 
-            // Position
+            // Position accessor
             byte[] posBytes = new byte[positions.Count * 4];
             Buffer.BlockCopy(positions.ToArray(), 0, posBytes, 0, posBytes.Length);
             int posBv = ctx.AddBufferView(posBytes, 12, 34962);
@@ -517,6 +610,56 @@ namespace CodeWalker.Export
             return localIdx;
         }
 
+        /// <summary>
+        /// Helper to convert IEEE 754 half-precision (2 bytes) to float.
+        /// </summary>
+        static class HalfHelper
+        {
+            public static float HalfToSingle(byte b0, byte b1)
+            {
+                uint half = (uint)(b0 | (b1 << 8));
+                return HalfToSingle(half);
+            }
+
+            public static float HalfToSingle(uint half)
+            {
+                uint sign = (half >> 15) & 0x1;
+                uint exponent = (half >> 10) & 0x1F;
+                uint mantissa = half & 0x3FF;
+
+                uint result;
+                if (exponent == 0)
+                {
+                    if (mantissa == 0)
+                    {
+                        // Zero
+                        result = sign << 31;
+                    }
+                    else
+                    {
+                        // Denormalized - normalize it
+                        exponent = 1;
+                        while ((mantissa & 0x400) == 0) { mantissa <<= 1; exponent++; }
+                        mantissa &= 0x3FF;
+                        result = (sign << 31) | ((exponent - 15 + 127) << 23) | (mantissa << 13);
+                    }
+                }
+                else if (exponent == 31)
+                {
+                    // Inf or NaN
+                    result = (sign << 31) | (0xFF << 23) | (mantissa << 13);
+                }
+                else
+                {
+                    // Normalized
+                    result = (sign << 31) | ((exponent - 15 + 127) << 23) | (mantissa << 13);
+                }
+
+                byte[] bytes = BitConverter.GetBytes(result);
+                return BitConverter.ToSingle(bytes, 0);
+            }
+        }
+
         static Texture FindDiffuseTexture(DrawableBase drawable, Texture fallbackTex)
         {
             var sg = drawable.ShaderGroup;
@@ -554,21 +697,30 @@ namespace CodeWalker.Export
 
             int imageIdx;
             byte[] rgbaPixels = null;
+
+            // Try DDSIO pixel extraction first (handles DXT1/3/5, BC4/5, uncompressed)
             try { rgbaPixels = DDSIO.GetPixels(tex, 0); } catch { }
 
             if (rgbaPixels != null && rgbaPixels.Length > 0)
             {
                 byte[] pngData = EncodePng(rgbaPixels, (int)tex.Width, (int)tex.Height);
-                int imgBv = ctx.AddBufferView(pngData);
-                var img = new GltfImage { name = compName + "_Diffuse", bufferView = imgBv, mimeType = "image/png" };
-                imageIdx = ctx.Images.Count;
-                ctx.Images.Add(img);
+                if (pngData != null && pngData.Length > 0)
+                {
+                    int imgBv = ctx.AddBufferView(pngData);
+                    var img = new GltfImage { name = compName + "_Diffuse", bufferView = imgBv, mimeType = "image/png" };
+                    imageIdx = ctx.Images.Count;
+                    ctx.Images.Add(img);
+                }
+                else
+                {
+                    // PNG encoding failed, embed as DDS
+                    imageIdx = EmbedDdsTexture(ctx, tex, compName);
+                }
             }
             else
             {
-                var img = new GltfImage { name = compName + "_Diffuse_Missing" };
-                imageIdx = ctx.Images.Count;
-                ctx.Images.Add(img);
+                // DDSIO failed (e.g. BC7 format) - try embedding raw DDS
+                imageIdx = EmbedDdsTexture(ctx, tex, compName);
             }
 
             var sampler = new GltfSampler();
@@ -595,6 +747,30 @@ namespace CodeWalker.Export
             return matIdx;
         }
 
+        /// <summary>
+        /// Fallback: embed the texture as a raw DDS file when pixel extraction fails (e.g. BC7).
+        /// </summary>
+        static int EmbedDdsTexture(ExportContext ctx, Texture tex, string compName)
+        {
+            byte[] ddsData = null;
+            try { ddsData = DDSIO.GetDDSFile(tex); } catch { }
+
+            if (ddsData != null && ddsData.Length > 0)
+            {
+                int imgBv = ctx.AddBufferView(ddsData);
+                var img = new GltfImage { name = compName + "_Diffuse_DDS", bufferView = imgBv, mimeType = "image/vnd-ms.dds" };
+                int imageIdx = ctx.Images.Count;
+                ctx.Images.Add(img);
+                return imageIdx;
+            }
+
+            // No texture data at all - create a placeholder
+            var placeholder = new GltfImage { name = compName + "_Diffuse_Missing" };
+            int phIdx = ctx.Images.Count;
+            ctx.Images.Add(placeholder);
+            return phIdx;
+        }
+
         #endregion
 
         #region Animation
@@ -615,7 +791,7 @@ namespace CodeWalker.Export
                 animData = clipAnim.Animation;
                 duration = clipAnim.EndTime - clipAnim.StartTime;
             }
-            else if (cme.Clip is ClipAnimationList clipList && clipList.Animations?.Length > 0)
+            else if (cme.Clip is ClipAnimationList clipList && clipList.Animations != null && clipList.Animations.Count > 0)
             {
                 animData = clipList.Animations[0].Animation;
                 duration = clipList.Animations[0].EndTime - clipList.Animations[0].StartTime;
@@ -649,7 +825,14 @@ namespace CodeWalker.Export
                     for (int f = 0; f < frameCount; f++)
                     {
                         Vector3 val = Vector3.Zero;
-                        try { var fp = animData.GetFramePosition(f * frameDelta); val = animData.EvaluateVector4(fp, bi, true); } catch { }
+                        try
+                        {
+                            var fp = animData.GetFramePosition(f * frameDelta);
+                            var v4 = animData.EvaluateVector4(fp, bi, true);
+                            val = new Vector3(v4.X, v4.Y, v4.Z); // explicit conversion, drop W
+                        }
+                        catch { }
+                        // Y-up LH to Y-up RH: glTF_X = GTA_X, glTF_Y = GTA_Z, glTF_Z = -GTA_Y
                         vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y);
                     }
                     byte[] vb = new byte[vals.Count * 4];
@@ -666,7 +849,13 @@ namespace CodeWalker.Export
                     for (int f = 0; f < frameCount; f++)
                     {
                         Quaternion val = Quaternion.Identity;
-                        try { var fp = animData.GetFramePosition(f * frameDelta); val = animData.EvaluateQuaternion(fp, bi, true); } catch { }
+                        try
+                        {
+                            var fp = animData.GetFramePosition(f * frameDelta);
+                            val = animData.EvaluateQuaternion(fp, bi, true);
+                        }
+                        catch { }
+                        // Y-up LH to Y-up RH quaternion conversion
                         vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y); vals.Add(val.W);
                     }
                     byte[] vb = new byte[vals.Count * 4];
@@ -683,7 +872,14 @@ namespace CodeWalker.Export
                     for (int f = 0; f < frameCount; f++)
                     {
                         Vector3 val = Vector3.One;
-                        try { var fp = animData.GetFramePosition(f * frameDelta); val = animData.EvaluateVector4(fp, bi, true); } catch { }
+                        try
+                        {
+                            var fp = animData.GetFramePosition(f * frameDelta);
+                            var v4 = animData.EvaluateVector4(fp, bi, true);
+                            val = new Vector3(v4.X, v4.Y, v4.Z); // explicit conversion, drop W
+                        }
+                        catch { }
+                        // Scale uses same axis swap as translation
                         vals.Add(val.X); vals.Add(val.Z); vals.Add(val.Y);
                     }
                     byte[] vb = new byte[vals.Count * 4];
@@ -863,7 +1059,7 @@ namespace CodeWalker.Export
                     var s = ctx.Samplers[i];
                     sb.Append("{\"magFilter\":"); sb.Append(s.magFilter);
                     sb.Append(",\"minFilter\":"); sb.Append(s.minFilter);
-                    sb.Append(",\"wrapS\":"); sb.Append(s.wrapS);
+                    sb.Append(",\"wrapS\":"); s.wrapS.ToString(); sb.Append(s.wrapS);
                     sb.Append(",\"wrapT\":"); sb.Append(s.wrapT);
                     sb.Append("}");
                 }
@@ -1010,84 +1206,94 @@ namespace CodeWalker.Export
 
         static byte[] EncodePng(byte[] rgbaPixels, int width, int height)
         {
+            if (rgbaPixels == null || rgbaPixels.Length < width * height * 4) return null;
+
             using (var ms = new MemoryStream())
             {
+                // PNG signature
                 ms.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
+
+                // IHDR chunk
                 byte[] ihdr = new byte[13];
                 WriteBE32(ihdr, 0, width); WriteBE32(ihdr, 4, height);
-                ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+                ihdr[8] = 8;  // bit depth
+                ihdr[9] = 6;  // color type: RGBA
+                ihdr[10] = 0; // compression
+                ihdr[11] = 0; // filter
+                ihdr[12] = 0; // interlace
                 WriteChunk(ms, 0x49484452, ihdr);
 
+                // IDAT chunk(s) - raw pixel data with filter byte per row
                 using (var rawMs = new MemoryStream())
                 {
                     for (int y = 0; y < height; y++)
                     {
-                        rawMs.WriteByte(0);
+                        rawMs.WriteByte(0); // None filter
                         int rowStart = y * width * 4;
-                        for (int x = 0; x < width; x++)
-                        {
-                            int idx = rowStart + x * 4;
-                            if (idx + 3 < rgbaPixels.Length)
-                            {
-                                rawMs.WriteByte(rgbaPixels[idx + 2]);
-                                rawMs.WriteByte(rgbaPixels[idx + 1]);
-                                rawMs.WriteByte(rgbaPixels[idx]);
-                                rawMs.WriteByte(rgbaPixels[idx + 3]);
-                            }
-                            else { rawMs.WriteByte(0); rawMs.WriteByte(0); rawMs.WriteByte(0); rawMs.WriteByte(255); }
-                        }
+                        rawMs.Write(rgbaPixels, rowStart, width * 4);
                     }
-                    WriteChunk(ms, 0x49444154, ZlibCompress(rawMs.ToArray()));
+                    byte[] rawBytes = rawMs.ToArray();
+
+                    // Compress with Deflate
+                    using (var compressedMs = new MemoryStream())
+                    {
+                        using (var ds = new DeflateStream(compressedMs, CompressionLevel.Optimal, true))
+                        {
+                            ds.Write(rawBytes, 0, rawBytes.Length);
+                        }
+                        WriteChunk(ms, 0x49444154, compressedMs.ToArray());
+                    }
                 }
+
+                // IEND chunk
                 WriteChunk(ms, 0x49454E44, new byte[0]);
+
                 return ms.ToArray();
             }
-        }
-
-        static void WriteBE32(byte[] buf, int offset, int value)
-        {
-            buf[offset] = (byte)((value >> 24) & 0xFF); buf[offset + 1] = (byte)((value >> 16) & 0xFF);
-            buf[offset + 2] = (byte)((value >> 8) & 0xFF); buf[offset + 3] = (byte)(value & 0xFF);
         }
 
         static void WriteChunk(Stream ms, uint type, byte[] data)
         {
-            byte[] lenBuf = new byte[4]; WriteBE32(lenBuf, 0, data.Length); ms.Write(lenBuf, 0, 4);
-            byte[] typeBuf = new byte[] { (byte)((type >> 24) & 0xFF), (byte)((type >> 16) & 0xFF), (byte)((type >> 8) & 0xFF), (byte)(type & 0xFF) };
-            ms.Write(typeBuf, 0, 4);
+            byte[] lenBytes = new byte[4];
+            WriteBE32(lenBytes, 0, data.Length);
+            ms.Write(lenBytes, 0, 4);
+
+            byte[] typeBytes = new byte[4];
+            typeBytes[0] = (byte)(type >> 24);
+            typeBytes[1] = (byte)(type >> 16);
+            typeBytes[2] = (byte)(type >> 8);
+            typeBytes[3] = (byte)(type);
+            ms.Write(typeBytes, 0, 4);
+
             ms.Write(data, 0, data.Length);
-            uint crc = Crc32(typeBuf, 0, 4); crc = Crc32(data, 0, data.Length, crc);
-            byte[] crcBuf = new byte[4]; WriteBE32(crcBuf, 0, (int)crc); ms.Write(crcBuf, 0, 4);
+
+            // CRC32 over type + data
+            uint crc = Crc32(typeBytes, 0, 4);
+            crc = Crc32(data, 0, data.Length, crc);
+            byte[] crcBytes = new byte[4];
+            WriteBE32(crcBytes, 0, (int)crc);
+            ms.Write(crcBytes, 0, 4);
         }
 
-        static byte[] ZlibCompress(byte[] data)
+        static void WriteBE32(byte[] buf, int offset, int value)
         {
-            using (var ms = new MemoryStream())
-            {
-                ms.WriteByte(0x78); ms.WriteByte(0x01);
-                using (var ds = new DeflateStream(ms, CompressionMode.Compress, true)) ds.Write(data, 0, data.Length);
-                byte[] adlerBuf = new byte[4]; WriteBE32(adlerBuf, 0, (int)Adler32(data)); ms.Write(adlerBuf, 0, 4);
-                return ms.ToArray();
-            }
+            buf[offset] = (byte)(value >> 24);
+            buf[offset + 1] = (byte)(value >> 16);
+            buf[offset + 2] = (byte)(value >> 8);
+            buf[offset + 3] = (byte)(value);
         }
 
-        static uint Adler32(byte[] data)
-        {
-            uint a = 1, b = 0;
-            for (int i = 0; i < data.Length; i++) { a = (a + data[i]) % 65521; b = (b + a) % 65521; }
-            return (b << 16) | a;
-        }
-
-        static uint[] _crc32Table;
         static uint Crc32(byte[] data, int offset, int length, uint crc = 0xFFFFFFFF)
         {
-            if (_crc32Table == null)
+            for (int i = offset; i < offset + length; i++)
             {
-                _crc32Table = new uint[256];
-                for (int i = 0; i < 256; i++) { uint c = (uint)i; for (int j = 0; j < 8; j++) c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1; _crc32Table[i] = c; }
+                crc ^= data[i];
+                for (int j = 0; j < 8; j++)
+                {
+                    crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+                }
             }
-            for (int i = offset; i < offset + length; i++) crc = _crc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-            return crc ^ 0xFFFFFFFF;
+            return ~crc;
         }
 
         #endregion
