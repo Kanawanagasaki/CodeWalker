@@ -950,7 +950,7 @@ namespace CodeWalker.Export
             if (shader == null) return false;
 
             // Check if this is a hair shader (ped_hair_spiked.sps, hash 100720695)
-            if (shader.FileName?.Hash != HairShaderHash) return false;
+            if (shader.FileName.Hash != HairShaderHash) return false;
 
             // Read orderNumber from shader parameters
             var sparams = shader.ParametersList?.Parameters;
