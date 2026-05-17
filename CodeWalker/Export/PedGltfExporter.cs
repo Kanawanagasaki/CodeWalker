@@ -250,12 +250,11 @@ namespace CodeWalker.Export
             ctx.Nodes.Add(pedRoot);
             ctx.NodeChildren[ctx.PedRootNodeIndex] = new List<int>();
 
-            // GTA V is left-handed Y-up: X=right, Y=forward, Z=up
+            // GTA V is left-handed: X=right, Y=forward, Z=up
             // glTF is right-handed Y-up: X=right, Y=up, Z=backward(-forward)
             // Conversion: glTF_X = GTA_X, glTF_Y = GTA_Z, glTF_Z = -GTA_Y
-            // This negates the Z axis to change handedness.
-            // For scale: glTF_Sx = GTA_Sx, glTF_Sy = GTA_Sz, glTF_Sz = -GTA_Sy
-            // (Z scale must be negated to match the negated Z axis)
+            // The coordinate change matrix P is a proper rotation (det=+1),
+            // so scale just swaps Y/Z components without negation: (sx, sz, sy)
 
             // Bone nodes
             for (int i = 0; i < bones.Length; i++)
@@ -269,11 +268,10 @@ namespace CodeWalker.Export
                 Quaternion r = bone.Rotation;
                 Vector3 s = bone.Scale;
                 node.translation = new float[] { t.X, t.Z, -t.Y };
-                // Quaternion axis swap: negate the Y component of the vector part
-                // and swap Y and Z axes to match the coordinate change
+                // Quaternion conversion for axis swap (X,Z,-Y): verified via similarity transform
                 node.rotation = new float[] { r.X, r.Z, -r.Y, r.W };
-                // Scale: Z must be negated to preserve negative determinant for handedness flip
-                node.scale = new float[] { s.X, s.Z, -s.Y };
+                // Scale: axis swap only, no negation (P is a rotation, P*S*P^T = diag(sx,sz,sy))
+                node.scale = new float[] { s.X, s.Z, s.Y };
 
                 int nodeIdx = ctx.Nodes.Count;
                 ctx.Nodes.Add(node);
@@ -298,18 +296,15 @@ namespace CodeWalker.Export
                 }
             }
 
-            // Compute inverse bind matrices from the converted glTF-space node world transforms.
-            // The IBM for each joint must be the inverse of that joint's world transform in glTF space.
-            // We compute the world transforms by walking the node hierarchy using the converted
-            // local transforms (T, R, S), then invert each one.
-            var worldTransforms = new Matrix[bones.Length];
-            ComputeWorldTransforms(ctx, bones, worldTransforms);
-
+            // Inverse bind matrices: convert from GTA space to glTF space.
+            // bone.BindTransformInv is the inverse of the world rest pose in GTA LH space.
+            // The correct conversion is: M_gltf = P * M_gta^T * P^T (row-vector to column-vector,
+            // with axis swap), which for a SharpDX row-major matrix M produces column-major output:
+            // Col i: (M11,M13,-M12,M14), (M31,M33,-M32,M34), (-M21,-M23,M22,-M24), (M41,M43,-M42,M44)
             var ibmFloats = new List<float>();
             for (int i = 0; i < bones.Length; i++)
             {
-                Matrix ibm = Matrix.Invert(worldTransforms[i]);
-                ibmFloats.AddRange(MatrixToColumnMajor(ibm));
+                ibmFloats.AddRange(ConvertMatrixToGltf(bones[i].BindTransformInv));
             }
             byte[] ibmBytes = new byte[ibmFloats.Count * 4];
             Buffer.BlockCopy(ibmFloats.ToArray(), 0, ibmBytes, 0, ibmBytes.Length);
@@ -328,55 +323,19 @@ namespace CodeWalker.Export
         }
 
         /// <summary>
-        /// Compute world transforms for each bone in glTF space by walking the hierarchy
-        /// and accumulating local transforms (T, R, S) from the already-converted glTF-space values.
+        /// Convert a GTA LH space matrix (SharpDX row-major, row-vector convention)
+        /// to glTF RH Y-up space (column-major, column-vector convention).
+        /// Formula: M_gltf_col = P * M_gta_row^T * P^T where P maps (X,Y,Z) → (X,Z,-Y).
+        /// Result is 16 floats in column-major order ready for glTF buffer.
         /// </summary>
-        static void ComputeWorldTransforms(ExportContext ctx, Bone[] bones, Matrix[] worldTransforms)
-        {
-            // Build local transforms from the glTF-space TRS stored in the nodes
-            var localTransforms = new Matrix[bones.Length];
-            for (int i = 0; i < bones.Length; i++)
-            {
-                int nodeIdx = ctx.BoneToNode[i];
-                var node = ctx.Nodes[nodeIdx];
-                var t = new Vector3(node.translation[0], node.translation[1], node.translation[2]);
-                var r = new Quaternion(node.rotation[0], node.rotation[1], node.rotation[2], node.rotation[3]);
-                var s = new Vector3(node.scale[0], node.scale[1], node.scale[2]);
-                // Build local TRS matrix: Scale → Rotate → Translate
-                localTransforms[i] = Matrix.AffineTransformation(1.0f, r, t);
-                localTransforms[i].M11 *= s.X; localTransforms[i].M12 *= s.X; localTransforms[i].M13 *= s.X;
-                localTransforms[i].M21 *= s.Y; localTransforms[i].M22 *= s.Y; localTransforms[i].M23 *= s.Y;
-                localTransforms[i].M31 *= s.Z; localTransforms[i].M32 *= s.Z; localTransforms[i].M33 *= s.Z;
-            }
-
-            // Walk the hierarchy: world = local * parent_world
-            // Process bones in order (they are sorted so parents come before children)
-            for (int i = 0; i < bones.Length; i++)
-            {
-                var bone = bones[i];
-                if (bone.ParentIndex >= 0 && bone.ParentIndex < bones.Length && bone.ParentIndex != i)
-                {
-                    worldTransforms[i] = localTransforms[i] * worldTransforms[bone.ParentIndex];
-                }
-                else
-                {
-                    worldTransforms[i] = localTransforms[i];
-                }
-            }
-        }
-
-        /// <summary>
-        /// Convert a SharpDX Matrix to glTF column-major float[16] array.
-        /// SharpDX Matrix is row-major storage; glTF expects column-major.
-        /// </summary>
-        static float[] MatrixToColumnMajor(Matrix m)
+        static float[] ConvertMatrixToGltf(Matrix m)
         {
             return new float[]
             {
-                m.M11, m.M21, m.M31, m.M41,
-                m.M12, m.M22, m.M32, m.M42,
-                m.M13, m.M23, m.M33, m.M43,
-                m.M14, m.M24, m.M34, m.M44,
+                m.M11,  m.M13, -m.M12,  m.M14,
+                m.M31,  m.M33, -m.M32,  m.M34,
+               -m.M21, -m.M23,  m.M22, -m.M24,
+                m.M41,  m.M43, -m.M42,  m.M44,
             };
         }
 
@@ -512,7 +471,7 @@ namespace CodeWalker.Export
                         BitConverter.ToSingle(vbytes, po + 4),
                         BitConverter.ToSingle(vbytes, po + 8));
                 }
-                // GTA V is left-handed Y-up, glTF is right-handed Y-up
+                // GTA V is left-handed (X=right, Y=forward, Z=up), glTF is right-handed Y-up
                 // Conversion: glTF_X = GTA_X, glTF_Y = GTA_Z, glTF_Z = -GTA_Y
                 float px = pos.X, py = pos.Z, pz = -pos.Y;
                 positions.Add(px); positions.Add(py); positions.Add(pz);
@@ -546,9 +505,9 @@ namespace CodeWalker.Export
                             BitConverter.ToSingle(vbytes, uo + 4));
                     }
                     // GTA V textures use V=0 at top (DirectX convention).
-                    // glTF textures also use V=0 at top (same as PNG/image convention).
-                    // No V-flip needed since both conventions match.
-                    texcoords.Add(uv.X); texcoords.Add(uv.Y);
+                    // glTF uses V=0 at bottom (OpenGL convention).
+                    // Must flip V: V_gltf = 1 - V_gta
+                    texcoords.Add(uv.X); texcoords.Add(1.0f - uv.Y);
                 }
 
                 // Blend weights and indices (skinning data)
@@ -946,9 +905,8 @@ namespace CodeWalker.Export
                             val = new Vector3(v4.X, v4.Y, v4.Z); // explicit conversion, drop W
                         }
                         catch { }
-                        // Scale: same axis swap as translation, but Z must be negated
-                        // to preserve the handedness flip (negative determinant for LH→RH)
-                        vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y);
+                        // Scale: axis swap (X,Z,Y) same as bone scale - no negation
+                        vals.Add(val.X); vals.Add(val.Z); vals.Add(val.Y);
                     }
                     byte[] vb = new byte[vals.Count * 4];
                     Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
@@ -1274,41 +1232,23 @@ namespace CodeWalker.Export
 
         static byte[] EncodePng(byte[] rgbaPixels, int width, int height)
         {
-            // Use System.Drawing.Bitmap for reliable PNG encoding.
-            // DDSIO.GetPixels for compressed formats (DXT1/3/5) applies swaprb which
-            // turns the decompressor's RGBA output into BGRA. For uncompressed formats
-            // like B8G8R8A8, no swap is applied so the output is already BGRA.
-            // In all cases, DDSIO.GetPixels returns BGRA byte order after its swap logic.
-            // Format32bppArgb in System.Drawing expects BGRA in memory, which matches.
-            // Additionally, we flip the image vertically because DDS textures are stored
-            // top-to-bottom, but after DDSIO extraction the rows are in top-to-bottom order
-            // which is the same as PNG/glTF. However, we need to flip because the texture
-            // coordinates no longer flip V (removed the 1-V flip), and GTA V textures have
-            // V=0 at top but glTF uses V=0 at bottom, so we flip the image pixels to match.
+            // Use System.Drawing.Bitmap for reliable PNG encoding from DDSIO pixel data.
+            // DDSIO.GetPixels always returns BGRA byte order:
+            //   - Compressed formats (DXT1/3/5, BC4/5): decompressor outputs RGBA, then
+            //     swaprb swaps R↔B producing BGRA
+            //   - Uncompressed B8G8R8A8: already BGRA, swaprb=false
+            // Format32bppArgb in System.Drawing expects BGRA in memory, so direct copy works.
+            // V-flip is handled at the UV coordinate level (1.0 - V), not here.
             try
             {
                 if (rgbaPixels == null || rgbaPixels.Length < width * height * 4) return null;
-
-                int pixelCount = width * height;
-                var flippedPixels = new byte[pixelCount * 4];
-                int rowBytes = width * 4;
-                // Flip rows: bottom row becomes top row (for V=0 at bottom glTF convention)
-                for (int y = 0; y < height; y++)
-                {
-                    int srcRow = (height - 1 - y) * rowBytes;
-                    int dstRow = y * rowBytes;
-                    Array.Copy(rgbaPixels, srcRow, flippedPixels, dstRow, rowBytes);
-                }
 
                 using (var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
                 {
                     var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, width, height),
                         ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-                    // DDSIO.GetPixels returns BGRA bytes for compressed formats after swaprb.
-                    // Format32bppArgb expects BGRA in memory - direct copy is correct.
-                    // For B8G8R8A8 format (no swaprb), data is also BGRA - also correct.
-                    // For A8B8G8R8 format (swaprb applied), data becomes BGRA - also correct.
-                    Marshal.Copy(flippedPixels, 0, bd.Scan0, flippedPixels.Length);
+                    // Direct copy: DDSIO returns BGRA, Format32bppArgb expects BGRA.
+                    Marshal.Copy(rgbaPixels, 0, bd.Scan0, rgbaPixels.Length);
                     bmp.UnlockBits(bd);
                     using (var ms = new MemoryStream())
                     {
