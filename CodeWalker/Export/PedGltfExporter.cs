@@ -433,12 +433,16 @@ namespace CodeWalker.Export
                 var models = drawable.DrawableModels?.High;
                 if (models == null) continue;
 
-                // Detect cloth components and build bone remapping.
-                // Cloth drawables have geom.BoneIds referencing regular skeletal bones (hands, legs, etc.)
-                // which causes severe distortion during animation. The cloth controller's BoneIds
-                // give the correct cloth bone tags. We remap each skeletal bone to the nearest
-                // cloth bone ancestor so cloth vertices follow cloth bones during animation.
-                Dictionary<ushort, ushort> clothBoneRemap = null;
+                // Detect cloth components and build cloth vertex data.
+                // Regular cloth drawable vertices use their original skeletal bone weights,
+                // which is the same approach as the in-app renderer — they deform properly
+                // with standard bone skinning during animation.
+                //
+                // Previously, a clothBoneRemap was used to remap all skeletal bone references
+                // to the nearest cloth bone ancestor. This collapsed multi-bone influences to
+                // a single bone, making cloth rigid (following one bone instead of deforming).
+                // That approach has been removed — regular vertices now keep their original
+                // skeletal bone weights for proper multi-bone deformation.
                 ClothVertexData clothVertexData = null;
                 var clothInst = (ped.Clothes != null && compIdx < ped.Clothes.Length) ? ped.Clothes[compIdx] : null;
                 if (clothInst?.CharCloth?.Controller != null && bones != null)
@@ -447,28 +451,6 @@ namespace CodeWalker.Export
                     var clothBoneTags = controller.BoneIds?.data_items;
                     if (clothBoneTags != null && clothBoneTags.Length > 0)
                     {
-                        // Map cloth bone tags to skeleton bone array indices
-                        var clothBoneArrayIndices = new HashSet<int>();
-                        foreach (uint tag in clothBoneTags)
-                        {
-                            if (skeleton.BonesMap.TryGetValue((ushort)tag, out var bone) && boneToArrayIndex.TryGetValue(bone, out int arrayIdx))
-                                clothBoneArrayIndices.Add(arrayIdx);
-                        }
-
-                        if (clothBoneArrayIndices.Count > 0)
-                        {
-                            // Build remapping: for each skeleton bone, find the nearest cloth bone ancestor
-                            clothBoneRemap = new Dictionary<ushort, ushort>(bones.Length);
-                            int defaultClothBone = -1;
-                            foreach (var idx in clothBoneArrayIndices) { defaultClothBone = idx; break; }
-
-                            for (int bi = 0; bi < bones.Length; bi++)
-                            {
-                                int nearest = FindNearestClothAncestor(bi, bones, clothBoneArrayIndices, defaultClothBone);
-                                clothBoneRemap[(ushort)bi] = (ushort)nearest;
-                            }
-                        }
-
                         // Build cloth vertex data for vertices where blendIndices[2] == 255.
                         // These "cloth vertices" use a different rendering path in the GTA V shader:
                         // their blend indices reference ClothInstance.Vertices[] instead of bone matrices,
@@ -524,7 +506,7 @@ namespace CodeWalker.Export
                         // rendered directly. The renderer skips them via disableRendering flag.
                         if (ShouldSkipGeometry(geom)) continue;
 
-                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothBoneRemap, clothVertexData);
+                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothVertexData);
                         if (prim != null)
                         {
                             if (materialIdx.HasValue) prim.material = materialIdx.Value;
@@ -554,7 +536,7 @@ namespace CodeWalker.Export
             }
         }
 
-        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton, Dictionary<ushort, ushort> clothBoneRemap = null, ClothVertexData clothVertexData = null)
+        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton, ClothVertexData clothVertexData = null)
         {
             // Use geom.VertexData which resolves Data1 ?? Data2 automatically
             var vdata = geom.VertexData;
@@ -597,7 +579,6 @@ namespace CodeWalker.Export
             var texcoords = new List<float>();
             var blendWeights = new List<float>();
             var blendJoints = new List<ushort>();
-            var clothVertexFlags = new List<bool>(); // true = cloth vertex (bi2==255), skip clothBoneRemap
             float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
             float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
 
@@ -723,7 +704,6 @@ namespace CodeWalker.Export
                     if (bi2 == 255 && clothVertexData != null)
                     {
                         // CLOTH VERTEX (blendIndices[2] == 255)
-                        clothVertexFlags.Add(true);
                         // Compute interpolation weights for the 3 cloth sim vertices
                         float wz = bw.Z, wy = bw.Y, wx = bw.X;
                         float tw = wz + wy + wx;
@@ -759,7 +739,6 @@ namespace CodeWalker.Export
                     else
                     {
                         // REGULAR VERTEX
-                        clothVertexFlags.Add(false);
                         float tw = bw.X + bw.Y + bw.Z + bw.W;
                         if (tw > 0.001f) { bw.X /= tw; bw.Y /= tw; bw.Z /= tw; bw.W /= tw; }
                         else { bw.X = 1f; bw.Y = 0f; bw.Z = 0f; bw.W = 0f; }
@@ -799,61 +778,14 @@ namespace CodeWalker.Export
 
             if (hasBlendData && hasSkin && blendWeights.Count > 0)
             {
-                // For cloth primitives, remap joint indices from skeletal bones to cloth bones.
-                // This prevents cloth vertices from following highly-mobile skeletal bones
-                // (hands, legs) during animation, which causes severe distortion.
-                // Cloth bones are children of skeletal bones, so they still move with the body.
-                // Note: cloth vertices (bi2==255) already have correct cloth bone weights and are skipped.
-                if (clothBoneRemap != null)
-                {
-                    for (int v = 0; v < vertCount; v++)
-                    {
-                        if (v < clothVertexFlags.Count && clothVertexFlags[v]) continue; // skip cloth vertices
-                        int b = v * 4;
-                        // Remap each joint through the cloth bone mapping
-                        var joints = new ushort[4];
-                        var weights = new float[4];
-                        for (int k = 0; k < 4; k++)
-                        {
-                            ushort origJoint = blendJoints[b + k];
-                            joints[k] = clothBoneRemap.TryGetValue(origJoint, out var remapped) ? remapped : origJoint;
-                            weights[k] = blendWeights[b + k];
-                        }
-
-                        // Combine weights for duplicate joints (after remapping, multiple
-                        // skeletal bones may map to the same cloth bone)
-                        var combined = new Dictionary<ushort, float>();
-                        for (int k = 0; k < 4; k++)
-                        {
-                            if (weights[k] < 0.0001f) continue;
-                            if (!combined.ContainsKey(joints[k]))
-                                combined[joints[k]] = 0f;
-                            combined[joints[k]] += weights[k];
-                        }
-
-                        // Sort by weight descending, take top 4 (glTF requires at most 4 joints)
-                        var sorted = combined.OrderByDescending(kv => kv.Value).Take(4).ToList();
-
-                        // Normalize weights so they sum to 1.0
-                        float totalW = sorted.Sum(kv => kv.Value);
-                        if (totalW < 0.001f) totalW = 1f;
-
-                        // Write back
-                        for (int k = 0; k < 4; k++)
-                        {
-                            if (k < sorted.Count)
-                            {
-                                blendJoints[b + k] = sorted[k].Key;
-                                blendWeights[b + k] = sorted[k].Value / totalW;
-                            }
-                            else
-                            {
-                                blendJoints[b + k] = 0;
-                                blendWeights[b + k] = 0f;
-                            }
-                        }
-                    }
-                }
+                // NOTE: The previous clothBoneRemap logic that remapped all skeletal bone
+                // references to the nearest cloth bone ancestor has been removed. That approach
+                // collapsed multi-bone influences to a single cloth bone, making the cloth rigid
+                // — it would just follow one bone and rotate instead of deforming naturally.
+                // Regular cloth drawable vertices now keep their original skeletal bone weights,
+                // matching the in-app renderer's behavior for proper multi-bone deformation.
+                // Cloth vertices (bi2==255) already have correct bone weights computed from
+                // CharClothBoneWeightsInds.
 
                 byte[] wBytes = new byte[blendWeights.Count * 4];
                 Buffer.BlockCopy(blendWeights.ToArray(), 0, wBytes, 0, wBytes.Length);
@@ -897,6 +829,9 @@ namespace CodeWalker.Export
         /// Find the nearest cloth bone ancestor for a given bone by walking up the hierarchy.
         /// If the bone itself is a cloth bone, returns its own index.
         /// If no ancestor is a cloth bone, returns defaultClothBone.
+        /// NOTE: This method is no longer used — the clothBoneRemap approach that called it
+        /// has been removed because it made cloth rigid by collapsing multi-bone influences.
+        /// Kept for reference in case a better remapping strategy is needed in the future.
         /// </summary>
         static int FindNearestClothAncestor(int boneIdx, Bone[] bones, HashSet<int> clothBoneIndices, int defaultClothBone)
         {
@@ -1173,27 +1108,14 @@ namespace CodeWalker.Export
             var boneIds = animData.BoneIds?.data_items;
             if (boneIds == null) return;
 
-            // Collect bone tags used by cloth controllers. Cloth mesh vertices have been
-            // remapped to reference cloth bones (via clothBoneRemap in BuildMeshes), so
-            // they correctly follow cloth bones during animation. However, cloth bones in
-            // GTA V are driven by runtime cloth simulation, not by animation clips. Their
-            // clip animation data (if any) is not meaningful for glTF export. Skip animation
-            // for cloth bones so they stay at bind pose; they will still move with the body
-            // through their parent-child relationship with skeletal bones in the hierarchy.
-            var clothBoneTags = new HashSet<ushort>();
-            if (ped.Clothes != null)
-            {
-                foreach (var cloth in ped.Clothes)
-                {
-                    if (cloth?.CharCloth?.Controller == null) continue;
-                    var cboneIds = cloth.CharCloth.Controller.BoneIds?.data_items;
-                    if (cboneIds == null) continue;
-                    foreach (var bid in cboneIds)
-                    {
-                        clothBoneTags.Add((ushort)bid);
-                    }
-                }
-            }
+            // NOTE: Previously, cloth controller bones were skipped from animation export
+            // because they were thought to be driven only by runtime cloth simulation.
+            // However, cloth vertices (bi2==255) in the GLTF export reference cloth bones
+            // via CharClothBoneWeightsInds, and those cloth bones benefit from animation
+            // data. Cloth bones are children of skeletal bones, so they inherit parent
+            // transforms regardless. If the clip provides animation data for cloth bones,
+            // including it gives better local deformation; if not, they stay at bind pose
+            // and still follow the body through the parent-child hierarchy.
 
             for (int bi = 0; bi < boneIds.Length; bi++)
             {
@@ -1202,10 +1124,6 @@ namespace CodeWalker.Export
                 // Do NOT use bone.Index since BoneToNode is keyed by array position,
                 // and bone.Index can differ from array position in GTA V ped skeletons.
                 if (!ctx.BoneTagToNode.TryGetValue(boneId.BoneId, out int nodeIdx)) continue;
-
-                // Skip animation for cloth controller bones - their drawable mesh bone
-                // weights are not designed for standard GPU skinning during animation.
-                if (clothBoneTags.Contains(boneId.BoneId)) continue;
 
                 if (boneId.Track == 0) // Translation
                 {
