@@ -394,6 +394,22 @@ namespace CodeWalker.Export
 
         #region Meshes
 
+        /// <summary>
+        /// Helper data for cloth vertex bone weight computation.
+        /// Passed to BuildPrimitive for vertices where blendIndices[2] == 255.
+        /// </summary>
+        class ClothVertexData
+        {
+            public CharClothBoneWeightsInds[] BoneWeightsInds;  // from Controller.BoneWeightsInds.data_items
+            public int[] ClothBoneToArrayIndex;                  // maps ClothInstance.Bones[i] → skeleton bone array index
+            public int DefaultClothBoneArrayIndex;               // fallback cloth bone
+        }
+
+        // Shader hash for ped_hair_spiked.sps — used to detect hair control mesh geometries
+        const uint HairShaderHash = 100720695;
+        // ShaderParamNames.orderNumber hash
+        const uint OrderNumberHash = 1617153586;
+
         static void BuildMeshes(ExportContext ctx, Ped ped)
         {
             string[] compNames = { "Head", "Berd", "Hair", "Uppr", "Lowr", "Hand", "Feet", "Teef", "Accs", "Task", "Decl", "Jbib" };
@@ -423,6 +439,7 @@ namespace CodeWalker.Export
                 // give the correct cloth bone tags. We remap each skeletal bone to the nearest
                 // cloth bone ancestor so cloth vertices follow cloth bones during animation.
                 Dictionary<ushort, ushort> clothBoneRemap = null;
+                ClothVertexData clothVertexData = null;
                 var clothInst = (ped.Clothes != null && compIdx < ped.Clothes.Length) ? ped.Clothes[compIdx] : null;
                 if (clothInst?.CharCloth?.Controller != null && bones != null)
                 {
@@ -451,6 +468,29 @@ namespace CodeWalker.Export
                                 clothBoneRemap[(ushort)bi] = (ushort)nearest;
                             }
                         }
+
+                        // Build cloth vertex data for vertices where blendIndices[2] == 255.
+                        // These "cloth vertices" use a different rendering path in the GTA V shader:
+                        // their blend indices reference ClothInstance.Vertices[] instead of bone matrices,
+                        // and their blend weights are barycentric interpolation weights.
+                        // We use CharacterClothController.BoneWeightsInds to compute proper bone weights.
+                        var clothBones = clothInst.Bones;
+                        var cbw = controller.BoneWeightsInds?.data_items;
+                        if (clothBones != null && cbw != null)
+                        {
+                            clothVertexData = new ClothVertexData();
+                            clothVertexData.BoneWeightsInds = cbw;
+                            clothVertexData.ClothBoneToArrayIndex = new int[clothBones.Length];
+                            for (int i = 0; i < clothBones.Length; i++)
+                            {
+                                if (clothBones[i] != null && boneToArrayIndex.TryGetValue(clothBones[i], out int aidx))
+                                    clothVertexData.ClothBoneToArrayIndex[i] = aidx;
+                                else
+                                    clothVertexData.ClothBoneToArrayIndex[i] = 0;
+                            }
+                            clothVertexData.DefaultClothBoneArrayIndex =
+                                clothVertexData.ClothBoneToArrayIndex.Length > 0 ? clothVertexData.ClothBoneToArrayIndex[0] : 0;
+                        }
                     }
                 }
 
@@ -478,7 +518,13 @@ namespace CodeWalker.Export
                     {
                         var geom = model.Geometries[gi];
                         if (geom == null) continue;
-                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothBoneRemap);
+
+                        // Skip hair control mesh geometries (orderNumber > 0 on hair shaders).
+                        // In GTA V, these geometries drive GPU tessellation and should not be
+                        // rendered directly. The renderer skips them via disableRendering flag.
+                        if (ShouldSkipGeometry(geom)) continue;
+
+                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothBoneRemap, clothVertexData);
                         if (prim != null)
                         {
                             if (materialIdx.HasValue) prim.material = materialIdx.Value;
@@ -508,7 +554,7 @@ namespace CodeWalker.Export
             }
         }
 
-        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton, Dictionary<ushort, ushort> clothBoneRemap = null)
+        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton, Dictionary<ushort, ushort> clothBoneRemap = null, ClothVertexData clothVertexData = null)
         {
             // Use geom.VertexData which resolves Data1 ?? Data2 automatically
             var vdata = geom.VertexData;
@@ -551,6 +597,7 @@ namespace CodeWalker.Export
             var texcoords = new List<float>();
             var blendWeights = new List<float>();
             var blendJoints = new List<ushort>();
+            var clothVertexFlags = new List<bool>(); // true = cloth vertex (bi2==255), skip clothBoneRemap
             float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
             float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
 
@@ -655,14 +702,7 @@ namespace CodeWalker.Export
                             break;
                     }
 
-                    // Normalize blend weights so they sum to 1.0
-                    float tw = bw.X + bw.Y + bw.Z + bw.W;
-                    if (tw > 0.001f) { bw.X /= tw; bw.Y /= tw; bw.Z /= tw; bw.W /= tw; }
-                    else { bw.X = 1f; bw.Y = 0f; bw.Z = 0f; bw.W = 0f; }
-                    blendWeights.Add(bw.X); blendWeights.Add(bw.Y); blendWeights.Add(bw.Z); blendWeights.Add(bw.W);
-
-                    // Read blend indices directly from raw bytes to avoid Color struct byte shuffling
-                    // These 4 bytes are local bone indices into geom.BoneIds[]
+                    // Read blend indices directly from raw bytes
                     byte bi0 = 0, bi1 = 0, bi2 = 0, bi3 = 0;
                     int bio = baseOff + biOffset;
                     if (bio + 4 <= vbytes.Length)
@@ -672,11 +712,65 @@ namespace CodeWalker.Export
                         bi2 = vbytes[bio + 2];
                         bi3 = vbytes[bio + 3];
                     }
-                    // Remap local bone indices to global skeleton bone indices
-                    blendJoints.Add(RemapBoneIndex(bi0, geomBoneIds, skeleton));
-                    blendJoints.Add(RemapBoneIndex(bi1, geomBoneIds, skeleton));
-                    blendJoints.Add(RemapBoneIndex(bi2, geomBoneIds, skeleton));
-                    blendJoints.Add(RemapBoneIndex(bi3, geomBoneIds, skeleton));
+
+                    // GTA V cloth/hair shader: when blendIndices[2] == 255, the vertex is a
+                    // "cloth vertex" that uses a different rendering path. The blend indices are
+                    // NOT bone indices — they index into the ClothInstance.Vertices[] buffer,
+                    // and the blend weights are barycentric interpolation weights (not bone weights).
+                    // In the shader: binds.w→cv0, binds.x→cv1, binds.y→cv2;
+                    // weights.z→cv0, weights.y→cv1, weights.x→cv2; weights.w = thickness.
+                    // We compute proper bone weights using CharacterClothController.BoneWeightsInds.
+                    if (bi2 == 255 && clothVertexData != null)
+                    {
+                        // CLOTH VERTEX (blendIndices[2] == 255)
+                        clothVertexFlags.Add(true);
+                        // Compute interpolation weights for the 3 cloth sim vertices
+                        float wz = bw.Z, wy = bw.Y, wx = bw.X;
+                        float tw = wz + wy + wx;
+                        if (tw > 0.001f) { wz /= tw; wy /= tw; wx /= tw; }
+                        else { wz = wy = wx = 0.333f; }
+
+                        // Collect bone weights from the 3 cloth sim vertices
+                        // bi3→cv0 (weight wz), bi0→cv1 (weight wy), bi1→cv2 (weight wx)
+                        var combined = new Dictionary<int, float>();
+                        AddClothBoneWeights(combined, bi3, wz, clothVertexData);
+                        AddClothBoneWeights(combined, bi0, wy, clothVertexData);
+                        AddClothBoneWeights(combined, bi1, wx, clothVertexData);
+
+                        // Take top 4 bone influences, normalize
+                        var sorted = combined.OrderByDescending(kv => kv.Value).Take(4).ToList();
+                        float totalW = sorted.Sum(kv => kv.Value);
+                        if (totalW < 0.001f) totalW = 1f;
+
+                        for (int k = 0; k < 4; k++)
+                        {
+                            if (k < sorted.Count)
+                            {
+                                blendJoints.Add((ushort)sorted[k].Key);
+                                blendWeights.Add(sorted[k].Value / totalW);
+                            }
+                            else
+                            {
+                                blendJoints.Add((ushort)clothVertexData.DefaultClothBoneArrayIndex);
+                                blendWeights.Add(0f);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // REGULAR VERTEX
+                        clothVertexFlags.Add(false);
+                        float tw = bw.X + bw.Y + bw.Z + bw.W;
+                        if (tw > 0.001f) { bw.X /= tw; bw.Y /= tw; bw.Z /= tw; bw.W /= tw; }
+                        else { bw.X = 1f; bw.Y = 0f; bw.Z = 0f; bw.W = 0f; }
+                        blendWeights.Add(bw.X); blendWeights.Add(bw.Y); blendWeights.Add(bw.Z); blendWeights.Add(bw.W);
+
+                        // Remap local bone indices to global skeleton bone indices
+                        blendJoints.Add(RemapBoneIndex(bi0, geomBoneIds, skeleton));
+                        blendJoints.Add(RemapBoneIndex(bi1, geomBoneIds, skeleton));
+                        blendJoints.Add(RemapBoneIndex(bi2, geomBoneIds, skeleton));
+                        blendJoints.Add(RemapBoneIndex(bi3, geomBoneIds, skeleton));
+                    }
                 }
             }
 
@@ -709,10 +803,12 @@ namespace CodeWalker.Export
                 // This prevents cloth vertices from following highly-mobile skeletal bones
                 // (hands, legs) during animation, which causes severe distortion.
                 // Cloth bones are children of skeletal bones, so they still move with the body.
+                // Note: cloth vertices (bi2==255) already have correct cloth bone weights and are skipped.
                 if (clothBoneRemap != null)
                 {
                     for (int v = 0; v < vertCount; v++)
                     {
+                        if (v < clothVertexFlags.Count && clothVertexFlags[v]) continue; // skip cloth vertices
                         int b = v * 4;
                         // Remap each joint through the cloth bone mapping
                         var joints = new ushort[4];
@@ -818,6 +914,60 @@ namespace CodeWalker.Export
             }
             // No cloth bone ancestor found, use the default (first cloth bone)
             return defaultClothBone >= 0 ? defaultClothBone : 0;
+        }
+
+        /// <summary>
+        /// Add bone weights from a cloth simulation vertex into the combined weight dictionary.
+        /// The cloth simulation vertex has 4 bone weights and 4 bone indices referencing
+        /// ClothInstance.Bones[], which are then mapped to skeleton bone array indices.
+        /// </summary>
+        static void AddClothBoneWeights(Dictionary<int, float> combined, int cvIdx, float interpWeight, ClothVertexData clothData)
+        {
+            if (clothData.BoneWeightsInds == null || cvIdx >= clothData.BoneWeightsInds.Length) return;
+            var bw = clothData.BoneWeightsInds[cvIdx];
+            float[] ws = { bw.Weights.X, bw.Weights.Y, bw.Weights.Z, bw.Weights.W };
+            uint[] idxs = { bw.Index0, bw.Index1, bw.Index2, bw.Index3 };
+            for (int i = 0; i < 4; i++)
+            {
+                if (ws[i] < 0.0001f) continue;
+                if (idxs[i] >= clothData.ClothBoneToArrayIndex.Length) continue;
+                int skelIdx = clothData.ClothBoneToArrayIndex[idxs[i]];
+                if (!combined.ContainsKey(skelIdx))
+                    combined[skelIdx] = 0f;
+                combined[skelIdx] += ws[i] * interpWeight;
+            }
+        }
+
+        /// <summary>
+        /// Check if a geometry should be skipped during export.
+        /// This replicates the renderer's logic: hair control mesh geometries (using
+        /// ped_hair_spiked.sps with orderNumber > 0) drive GPU tessellation and should
+        /// not be rendered directly.
+        /// </summary>
+        static bool ShouldSkipGeometry(DrawableGeometry geom)
+        {
+            var shader = geom.Shader;
+            if (shader == null) return false;
+
+            // Check if this is a hair shader (ped_hair_spiked.sps, hash 100720695)
+            if (shader.FileName?.Hash != HairShaderHash) return false;
+
+            // Read orderNumber from shader parameters
+            var sparams = shader.ParametersList?.Parameters;
+            var hashes = shader.ParametersList?.Hashes;
+            if (sparams == null || hashes == null) return false;
+
+            for (int pi = 0; pi < sparams.Length && pi < hashes.Length; pi++)
+            {
+                if ((uint)hashes[pi] == OrderNumberHash)
+                {
+                    var param = sparams[pi];
+                    if (param?.Data is SharpDX.Vector4 v && v.X > 0.0f)
+                        return true;
+                    break;
+                }
+            }
+            return false;
         }
 
         /// <summary>
