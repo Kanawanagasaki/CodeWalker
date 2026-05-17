@@ -555,10 +555,9 @@ namespace CodeWalker.Export
                             BitConverter.ToSingle(vbytes, uo),
                             BitConverter.ToSingle(vbytes, uo + 4));
                     }
-                    // GTA V textures use V=0 at top (DirectX convention).
-                    // glTF uses V=0 at bottom (OpenGL convention).
-                    // Must flip V: V_gltf = 1 - V_gta
-                    texcoords.Add(uv.X); texcoords.Add(1.0f - uv.Y);
+                    // glTF 2.0 spec: UV (0,0) = upper-left corner of texture image.
+                    // This matches DirectX/GTA V convention (V=0 at top), so no flip needed.
+                    texcoords.Add(uv.X); texcoords.Add(uv.Y);
                 }
 
                 // Blend weights and indices (skinning data)
@@ -899,6 +898,30 @@ namespace CodeWalker.Export
             var boneIds = animData.BoneIds?.data_items;
             if (boneIds == null) return;
 
+            // Collect bone tags used by cloth controllers. Cloth mesh vertices are
+            // rendered by CodeWalker through ClothInstance (CPU-skinned with separate
+            // vertex data and bone weights from CharacterClothController), NOT through
+            // the standard GPU skinning pipeline that the drawable mesh uses.
+            // The drawable mesh's cloth vertices have bone weights that only produce
+            // correct results at rest pose (when all skin transforms are identity).
+            // When cloth bones are animated via standard GPU skinning, these weights
+            // cause severe distortion. Skip animation for cloth bones to keep the
+            // cloth at its rest pose shape during animation.
+            var clothBoneTags = new HashSet<ushort>();
+            if (ped.Clothes != null)
+            {
+                foreach (var cloth in ped.Clothes)
+                {
+                    if (cloth?.CharCloth?.Controller == null) continue;
+                    var cboneIds = cloth.CharCloth.Controller.BoneIds?.data_items;
+                    if (cboneIds == null) continue;
+                    foreach (var bid in cboneIds)
+                    {
+                        clothBoneTags.Add((ushort)bid);
+                    }
+                }
+            }
+
             for (int bi = 0; bi < boneIds.Length; bi++)
             {
                 var boneId = boneIds[bi];
@@ -906,6 +929,10 @@ namespace CodeWalker.Export
                 // Do NOT use bone.Index since BoneToNode is keyed by array position,
                 // and bone.Index can differ from array position in GTA V ped skeletons.
                 if (!ctx.BoneTagToNode.TryGetValue(boneId.BoneId, out int nodeIdx)) continue;
+
+                // Skip animation for cloth controller bones - their drawable mesh bone
+                // weights are not designed for standard GPU skinning during animation.
+                if (clothBoneTags.Contains(boneId.BoneId)) continue;
 
                 if (boneId.Track == 0) // Translation
                 {
@@ -1300,7 +1327,7 @@ namespace CodeWalker.Export
             //     swaprb swaps R↔B producing BGRA
             //   - Uncompressed B8G8R8A8: already BGRA, swaprb=false
             // Format32bppArgb in System.Drawing expects BGRA in memory, so direct copy works.
-            // V-flip is handled at the UV coordinate level (1.0 - V), not here.
+            // UV coordinates are NOT flipped since glTF and DirectX both use V=0 at top.
             try
             {
                 if (rgbaPixels == null || rgbaPixels.Length < width * height * 4) return null;
