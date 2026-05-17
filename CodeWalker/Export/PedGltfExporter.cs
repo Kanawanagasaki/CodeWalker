@@ -397,6 +397,17 @@ namespace CodeWalker.Export
         static void BuildMeshes(ExportContext ctx, Ped ped)
         {
             string[] compNames = { "Head", "Berd", "Hair", "Uppr", "Lowr", "Hand", "Feet", "Teef", "Accs", "Task", "Decl", "Jbib" };
+            var skeleton = ped.Skeleton;
+            var bones = skeleton?.Bones?.Items;
+
+            // Pre-build Bone→array-index lookup for cloth bone remapping
+            Dictionary<Bone, int> boneToArrayIndex = null;
+            if (bones != null)
+            {
+                boneToArrayIndex = new Dictionary<Bone, int>(bones.Length);
+                for (int i = 0; i < bones.Length; i++)
+                    boneToArrayIndex[bones[i]] = i;
+            }
 
             for (int compIdx = 0; compIdx < 12; compIdx++)
             {
@@ -405,6 +416,43 @@ namespace CodeWalker.Export
                 var texture = ped.Textures[compIdx];
                 var models = drawable.DrawableModels?.High;
                 if (models == null) continue;
+
+                // Detect cloth components and build bone remapping.
+                // Cloth drawables have geom.BoneIds referencing regular skeletal bones (hands, legs, etc.)
+                // which causes severe distortion during animation. The cloth controller's BoneIds
+                // give the correct cloth bone tags. We remap each skeletal bone to the nearest
+                // cloth bone ancestor so cloth vertices follow cloth bones during animation.
+                Dictionary<ushort, ushort> clothBoneRemap = null;
+                var clothInst = (ped.Clothes != null && compIdx < ped.Clothes.Length) ? ped.Clothes[compIdx] : null;
+                if (clothInst?.CharCloth?.Controller != null && bones != null)
+                {
+                    var controller = clothInst.CharCloth.Controller;
+                    var clothBoneTags = controller.BoneIds?.data_items;
+                    if (clothBoneTags != null && clothBoneTags.Length > 0)
+                    {
+                        // Map cloth bone tags to skeleton bone array indices
+                        var clothBoneArrayIndices = new HashSet<int>();
+                        foreach (uint tag in clothBoneTags)
+                        {
+                            if (skeleton.BonesMap.TryGetValue((ushort)tag, out var bone) && boneToArrayIndex.TryGetValue(bone, out int arrayIdx))
+                                clothBoneArrayIndices.Add(arrayIdx);
+                        }
+
+                        if (clothBoneArrayIndices.Count > 0)
+                        {
+                            // Build remapping: for each skeleton bone, find the nearest cloth bone ancestor
+                            clothBoneRemap = new Dictionary<ushort, ushort>(bones.Length);
+                            int defaultClothBone = -1;
+                            foreach (var idx in clothBoneArrayIndices) { defaultClothBone = idx; break; }
+
+                            for (int bi = 0; bi < bones.Length; bi++)
+                            {
+                                int nearest = FindNearestClothAncestor(bi, bones, clothBoneArrayIndices, defaultClothBone);
+                                clothBoneRemap[(ushort)bi] = (ushort)nearest;
+                            }
+                        }
+                    }
+                }
 
                 var diffuseTex = FindDiffuseTexture(drawable, texture);
                 int? materialIdx = null;
@@ -430,7 +478,7 @@ namespace CodeWalker.Export
                     {
                         var geom = model.Geometries[gi];
                         if (geom == null) continue;
-                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton);
+                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothBoneRemap);
                         if (prim != null)
                         {
                             if (materialIdx.HasValue) prim.material = materialIdx.Value;
@@ -460,7 +508,7 @@ namespace CodeWalker.Export
             }
         }
 
-        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton)
+        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton, Dictionary<ushort, ushort> clothBoneRemap = null)
         {
             // Use geom.VertexData which resolves Data1 ?? Data2 automatically
             var vdata = geom.VertexData;
@@ -657,6 +705,60 @@ namespace CodeWalker.Export
 
             if (hasBlendData && hasSkin && blendWeights.Count > 0)
             {
+                // For cloth primitives, remap joint indices from skeletal bones to cloth bones.
+                // This prevents cloth vertices from following highly-mobile skeletal bones
+                // (hands, legs) during animation, which causes severe distortion.
+                // Cloth bones are children of skeletal bones, so they still move with the body.
+                if (clothBoneRemap != null)
+                {
+                    for (int v = 0; v < vertCount; v++)
+                    {
+                        int b = v * 4;
+                        // Remap each joint through the cloth bone mapping
+                        var joints = new ushort[4];
+                        var weights = new float[4];
+                        for (int k = 0; k < 4; k++)
+                        {
+                            ushort origJoint = blendJoints[b + k];
+                            joints[k] = clothBoneRemap.TryGetValue(origJoint, out var remapped) ? remapped : origJoint;
+                            weights[k] = blendWeights[b + k];
+                        }
+
+                        // Combine weights for duplicate joints (after remapping, multiple
+                        // skeletal bones may map to the same cloth bone)
+                        var combined = new Dictionary<ushort, float>();
+                        for (int k = 0; k < 4; k++)
+                        {
+                            if (weights[k] < 0.0001f) continue;
+                            if (!combined.ContainsKey(joints[k]))
+                                combined[joints[k]] = 0f;
+                            combined[joints[k]] += weights[k];
+                        }
+
+                        // Sort by weight descending, take top 4 (glTF requires at most 4 joints)
+                        var sorted = combined.OrderByDescending(kv => kv.Value).Take(4).ToList();
+
+                        // Normalize weights so they sum to 1.0
+                        float totalW = sorted.Sum(kv => kv.Value);
+                        if (totalW < 0.001f) totalW = 1f;
+
+                        // Write back
+                        for (int k = 0; k < 4; k++)
+                        {
+                            if (k < sorted.Count)
+                            {
+                                blendJoints[b + k] = sorted[k].Key;
+                                blendWeights[b + k] = sorted[k].Value / totalW;
+                            }
+                            else
+                            {
+                                blendJoints[b + k] = 0;
+                                blendWeights[b + k] = 0f;
+                            }
+                        }
+                    }
+                }
+
                 byte[] wBytes = new byte[blendWeights.Count * 4];
                 Buffer.BlockCopy(blendWeights.ToArray(), 0, wBytes, 0, wBytes.Length);
                 int wBv = ctx.AddBufferView(wBytes, 16, 34962);
@@ -693,6 +795,29 @@ namespace CodeWalker.Export
             //   var id = boneids[b]; geom.BoneTransforms[b] = bonetransforms[id];
             if (geomBoneIds == null || localIdx >= geomBoneIds.Length) return 0;
             return geomBoneIds[localIdx];
+        }
+
+        /// <summary>
+        /// Find the nearest cloth bone ancestor for a given bone by walking up the hierarchy.
+        /// If the bone itself is a cloth bone, returns its own index.
+        /// If no ancestor is a cloth bone, returns defaultClothBone.
+        /// </summary>
+        static int FindNearestClothAncestor(int boneIdx, Bone[] bones, HashSet<int> clothBoneIndices, int defaultClothBone)
+        {
+            int current = boneIdx;
+            int limit = bones.Length + 1; // prevent infinite loops from bad data
+            while (current >= 0 && current < bones.Length && limit-- > 0)
+            {
+                if (clothBoneIndices.Contains(current))
+                    return current;
+                var bone = bones[current];
+                if (bone.ParentIndex >= 0 && bone.ParentIndex < bones.Length && bone.ParentIndex != current)
+                    current = bone.ParentIndex;
+                else
+                    break; // reached root
+            }
+            // No cloth bone ancestor found, use the default (first cloth bone)
+            return defaultClothBone >= 0 ? defaultClothBone : 0;
         }
 
         /// <summary>
@@ -898,15 +1023,13 @@ namespace CodeWalker.Export
             var boneIds = animData.BoneIds?.data_items;
             if (boneIds == null) return;
 
-            // Collect bone tags used by cloth controllers. Cloth mesh vertices are
-            // rendered by CodeWalker through ClothInstance (CPU-skinned with separate
-            // vertex data and bone weights from CharacterClothController), NOT through
-            // the standard GPU skinning pipeline that the drawable mesh uses.
-            // The drawable mesh's cloth vertices have bone weights that only produce
-            // correct results at rest pose (when all skin transforms are identity).
-            // When cloth bones are animated via standard GPU skinning, these weights
-            // cause severe distortion. Skip animation for cloth bones to keep the
-            // cloth at its rest pose shape during animation.
+            // Collect bone tags used by cloth controllers. Cloth mesh vertices have been
+            // remapped to reference cloth bones (via clothBoneRemap in BuildMeshes), so
+            // they correctly follow cloth bones during animation. However, cloth bones in
+            // GTA V are driven by runtime cloth simulation, not by animation clips. Their
+            // clip animation data (if any) is not meaningful for glTF export. Skip animation
+            // for cloth bones so they stay at bind pose; they will still move with the body
+            // through their parent-child relationship with skeletal bones in the hierarchy.
             var clothBoneTags = new HashSet<ushort>();
             if (ped.Clothes != null)
             {
