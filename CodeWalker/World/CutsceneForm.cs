@@ -640,6 +640,8 @@ namespace CodeWalker.World
             }
         }
 
+        private BoneSwapDebugPanel _boneSwapPanel;
+
         private void BoneDebugButton_Click(object sender, EventArgs e)
         {
             if (Cutscene == null)
@@ -666,10 +668,16 @@ namespace CodeWalker.World
                 return;
             }
 
-            using (var panel = new BoneSwapDebugPanel(Cutscene))
+            // If panel is already open, just bring it to front
+            if (_boneSwapPanel != null && !_boneSwapPanel.IsDisposed)
             {
-                panel.ShowDialog(this);
+                _boneSwapPanel.Activate();
+                return;
             }
+
+            _boneSwapPanel = new BoneSwapDebugPanel(Cutscene);
+            _boneSwapPanel.FormClosed += (s, args) => { _boneSwapPanel = null; };
+            _boneSwapPanel.Show(this); // Non-modal: allows camera/cutscene interaction
         }
 
         /// <summary>

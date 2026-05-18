@@ -17,6 +17,20 @@ namespace CodeWalker.World
         private Cutscene _cutscene;
         private Dictionary<ushort, Bone> _facialBones = new Dictionary<ushort, Bone>();
 
+        // Allow showing the panel without stealing focus from the main viewport
+        protected override bool ShowWithoutActivation => true;
+
+        private const int WS_EX_NOACTIVATE = 0x08000000;
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= WS_EX_NOACTIVATE; // Prevent the window from being activated when shown
+                return cp;
+            }
+        }
+
         private ListBox BoneListA;
         private ListBox BoneListB;
         private Button SwapButton;
@@ -42,9 +56,12 @@ namespace CodeWalker.World
             this.Text = "Facial Bone Swap Debug Panel";
             this.Size = new Size(720, 520);
             this.FormBorderStyle = FormBorderStyle.SizableToolWindow;
-            this.StartPosition = FormStartPosition.CenterParent;
+            this.StartPosition = FormStartPosition.Manual;
+            this.Location = new Point(100, 100); // Off to the side, not center
             this.MinimizeBox = false;
             this.MaximizeBox = false;
+            this.ShowInTaskbar = false;
+            this.TopMost = false; // Explicitly not top-most so it doesn't block the viewport
 
             // Ped selector
             PedLabel = new Label();
