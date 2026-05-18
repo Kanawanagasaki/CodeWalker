@@ -1,4 +1,5 @@
-﻿using CodeWalker.GameFiles;
+﻿using CodeWalker.Export;
+using CodeWalker.GameFiles;
 using CodeWalker.Rendering;
 using CodeWalker.Utils;
 using SharpDX;
@@ -465,6 +466,64 @@ namespace CodeWalker.World
             if (sp != null)
             {
                 sp.SetVolume(Volume);
+            }
+        }
+
+        private void ExportGltfButton_Click(object sender, EventArgs e)
+        {
+            if (Cutscene == null)
+            {
+                MessageBox.Show("No cutscene loaded. Please select a cutscene first.", "Export Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (Cutscene.SceneObjects == null || Cutscene.SceneObjects.Count == 0)
+            {
+                MessageBox.Show("No objects in the cutscene.", "Export Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Show the object selection dialog
+            using (var selDlg = new CutsceneExportSelectionDialog(Cutscene))
+            {
+                if (selDlg.ShowDialog(this) != DialogResult.OK) return;
+
+                var selectedObjects = selDlg.GetSelectedObjects();
+                if (selectedObjects == null || !selectedObjects.Any())
+                {
+                    MessageBox.Show("No objects selected for export.", "Export Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                using (var sfd = new SaveFileDialog())
+                {
+                    sfd.Title = "Export Cutscene as glTF/GLB";
+                    var csName = Cutscene.CutFile?.FileEntry?.GetShortName() ?? "cutscene";
+                    sfd.FileName = csName + ".glb";
+                    sfd.Filter = "GLB Binary glTF|*.glb|glTF (embedded)|*.gltf|All files|*.*";
+                    sfd.DefaultExt = "glb";
+                    sfd.AddExtension = true;
+
+                    if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+                    try
+                    {
+                        Cursor = Cursors.WaitCursor;
+                        CutsceneGltfExporter.Export(Cutscene, selectedObjects, sfd.FileName);
+                        Cursor = Cursors.Default;
+                        MessageBox.Show("Export completed successfully!\n\nFile: " + sfd.FileName,
+                            "Export Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    catch (Exception ex)
+                    {
+                        Cursor = Cursors.Default;
+                        MessageBox.Show("Export failed:\n\n" + ex.Message + "\n\n" + ex.StackTrace,
+                            "Export Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                }
             }
         }
     }

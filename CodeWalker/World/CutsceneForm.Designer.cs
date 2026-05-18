@@ -44,6 +44,7 @@
             this.VolumeTrackBar = new System.Windows.Forms.TrackBar();
             this.SubtitlesCheckBox = new System.Windows.Forms.CheckBox();
             this.AudioCheckBox = new System.Windows.Forms.CheckBox();
+            this.ExportGltfButton = new System.Windows.Forms.Button();
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).BeginInit();
             this.splitContainer1.Panel1.SuspendLayout();
             this.splitContainer1.Panel2.SuspendLayout();
@@ -217,11 +218,23 @@
             this.AudioCheckBox.UseVisualStyleBackColor = true;
             this.AudioCheckBox.CheckedChanged += new System.EventHandler(this.AudioCheckBox_CheckedChanged);
             // 
+            // ExportGltfButton
+            // 
+            this.ExportGltfButton.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
+            this.ExportGltfButton.Location = new System.Drawing.Point(614, 33);
+            this.ExportGltfButton.Name = "ExportGltfButton";
+            this.ExportGltfButton.Size = new System.Drawing.Size(100, 23);
+            this.ExportGltfButton.TabIndex = 14;
+            this.ExportGltfButton.Text = "Export glTF";
+            this.ExportGltfButton.UseVisualStyleBackColor = true;
+            this.ExportGltfButton.Click += new System.EventHandler(this.ExportGltfButton_Click);
+            // 
             // CutsceneForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(724, 461);
+            this.Controls.Add(this.ExportGltfButton);
             this.Controls.Add(this.VolumeTrackBar);
             this.Controls.Add(this.AudioCheckBox);
             this.Controls.Add(this.SubtitlesCheckBox);
@@ -266,5 +279,6 @@
         private System.Windows.Forms.TrackBar VolumeTrackBar;
         private System.Windows.Forms.CheckBox SubtitlesCheckBox;
         private System.Windows.Forms.CheckBox AudioCheckBox;
+        private System.Windows.Forms.Button ExportGltfButton;
     }
 }
