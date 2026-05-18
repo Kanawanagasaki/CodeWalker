@@ -412,6 +412,53 @@ namespace CodeWalker.Rendering
             var bones = Skeleton.Bones?.Items;
             var bonetransforms = Skeleton.BoneTransforms;
 
+            // Apply bone swap proxy at render time: if a swap mapping exists for bone X,
+            // replace X's GPU transform with the transform of the bone it's swapped with.
+            // This is a READ-ONLY proxy — the underlying bone.Anim* fields and skeleton
+            // data are never modified, so clearing swaps instantly restores correct rendering.
+            if (FacialBoneSwapMap.Enabled && FacialBoneSwapMap.Count > 0 && bones != null && bonetransforms != null)
+            {
+                // Build a Tag→index lookup so we can find bones by their Tag ID
+                var tagToIndex = new Dictionary<ushort, int>();
+                for (int i = 0; i < bones.Length; i++)
+                {
+                    if (bones[i] != null)
+                        tagToIndex[bones[i].Tag] = i;
+                }
+
+                // Build a substitution map: for each bone index, which index should we
+                // read the transform from? This handles bidirectional swaps correctly
+                // without double-swapping (since SwapBones stores both A→B and B→A).
+                var subst = new int[bonetransforms.Length];
+                for (int i = 0; i < subst.Length; i++) subst[i] = i; // identity
+
+                var swapMap = FacialBoneSwapMap.GetSwapMap();
+                foreach (var kvp in swapMap)
+                {
+                    ushort fromTag = kvp.Key;
+                    ushort toTag = kvp.Value;
+
+                    int fromIdx, toIdx;
+                    if (tagToIndex.TryGetValue(fromTag, out fromIdx) &&
+                        tagToIndex.TryGetValue(toTag, out toIdx))
+                    {
+                        // "Bone fromTag should render with toTag's transform"
+                        subst[fromIdx] = toIdx;
+                    }
+                }
+
+                // Apply substitutions into a fresh copy so we don't corrupt the source array
+                // (Skeleton.BoneTransforms is rebuilt every frame from bone.SkinTransform,
+                // but reading from it while overwriting could cause chained lookups)
+                var swapped = new Matrix3_s[bonetransforms.Length];
+                for (int i = 0; i < swapped.Length; i++)
+                {
+                    swapped[i] = bonetransforms[subst[i]];
+                }
+                bonetransforms = swapped;
+                Skeleton.BoneTransforms = swapped;
+            }
+
             var drawbl = Key;
             if (AllModels == null) return;
             for (int i = 0; i < AllModels.Length; i++)
@@ -600,13 +647,9 @@ namespace CodeWalker.Rendering
                     }
                 }
 
-                // Apply debug bone swap mapping for facial tracks.
-                // This redirects which skeleton bone receives the animation data
-                // without modifying the underlying data structures.
-                if ((track == 24) || (track == 25) || (track == 26))
-                {
-                    boneid = FacialBoneSwapMap.RemapBoneId(boneid);
-                }
+                // NOTE: Bone swap proxy is applied at render time in UpdateBoneTransforms(),
+                // not here. Writing swapped bone IDs here would corrupt the skeleton data
+                // (animation for bone A would be written into bone B's AnimRotation etc.)
 
                 Bone bone = null;
                 skel?.BonesMap?.TryGetValue(boneid, out bone);

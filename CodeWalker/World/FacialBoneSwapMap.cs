@@ -4,13 +4,15 @@ namespace CodeWalker.World
 {
     /// <summary>
     /// Static class holding facial bone swap mappings for debug purposes.
-    /// This allows swapping which skeleton bone receives animation data
-    /// for facial expression tracks (24, 25, 26) without modifying the
-    /// underlying data structures. Only the renderer's bone lookup is
-    /// redirected through this mapping.
+    /// This acts as a RENDER-TIME PROXY only — when the renderer builds the
+    /// final bone transform array for the GPU, it checks this map and substitutes
+    /// transforms accordingly. The underlying skeleton data (bone.AnimRotation,
+    /// bone.AnimTranslation, etc.) is NEVER modified, so clearing all swaps
+    /// instantly restores correct rendering without any residual state.
     /// 
-    /// Usage: Set FacialBoneSwapMap[boneIdA] = boneIdB to make the renderer
-    /// apply animation data intended for boneIdA to boneIdB instead.
+    /// Usage: SwapBones(boneIdA, boneIdB) makes the renderer display bone A
+    /// with B's transform and B with A's transform. Clearing the swap map
+    /// restores original rendering on the very next frame.
     /// </summary>
     public static class FacialBoneSwapMap
     {
