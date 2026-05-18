@@ -82,6 +82,9 @@ namespace CodeWalker.Export
         {
             public string name;
             public GltfPbrMetallicRoughness pbrMetallicRoughness;
+            public string alphaMode; // "OPAQUE" (default), "MASK", "BLEND"
+            public float? alphaCutoff; // used with MASK mode, default 0.5
+            public bool doubleSided;
         }
 
         class GltfPbrMetallicRoughness
@@ -410,6 +413,17 @@ namespace CodeWalker.Export
         // ShaderParamNames.orderNumber hash
         const uint OrderNumberHash = 1617153586;
 
+        // Bone tags for ThighRoll bones that need rotation copied from main Thigh bones.
+        // This replicates the hardcoded hack in Renderable.cs (lines 517-518):
+        //   RB_L_ThighRoll (23639) → SKEL_L_Thigh (58271)
+        //   RB_R_ThighRoll (6442)  → SKEL_R_Thigh (51826)
+        // Without this, ThighRoll bones stay at bind pose while the thigh animates,
+        // causing the leg to "arch" or appear noodly in Blender.
+        const ushort BoneTag_RB_L_ThighRoll = 23639;
+        const ushort BoneTag_RB_R_ThighRoll = 6442;
+        const ushort BoneTag_SKEL_L_Thigh = 58271;
+        const ushort BoneTag_SKEL_R_Thigh = 51826;
+
         static void BuildMeshes(ExportContext ctx, Ped ped)
         {
             string[] compNames = { "Head", "Berd", "Hair", "Uppr", "Lowr", "Hand", "Feet", "Teef", "Accs", "Task", "Decl", "Jbib" };
@@ -479,7 +493,7 @@ namespace CodeWalker.Export
                 var diffuseTex = FindDiffuseTexture(drawable, texture);
                 int? materialIdx = null;
                 if (diffuseTex != null)
-                    materialIdx = ExportTexture(ctx, diffuseTex, compNames[compIdx]);
+                    materialIdx = ExportTexture(ctx, diffuseTex, compNames[compIdx], drawable);
                 else
                 {
                     var mat = new GltfMaterial
@@ -984,7 +998,7 @@ namespace CodeWalker.Export
             return embeddedMatch ?? fallbackTex;
         }
 
-        static int ExportTexture(ExportContext ctx, Texture tex, string compName)
+        static int ExportTexture(ExportContext ctx, Texture tex, string compName, DrawableBase drawable = null)
         {
             if (tex == null) return -1;
             if (ctx.TextureToGltfIndex.TryGetValue(tex.NameHash, out int existingIdx))
@@ -995,6 +1009,24 @@ namespace CodeWalker.Export
 
             // Try DDSIO pixel extraction first (handles DXT1/3/5, BC4/5, uncompressed)
             try { rgbaPixels = DDSIO.GetPixels(tex, 0); } catch { }
+
+            // Detect whether the texture has meaningful alpha data.
+            // We check two things:
+            //   1. The texture format — DXT3, DXT5, BC7, A8R8G8B8 etc. all support alpha
+            //   2. The shader used — hair shaders (ped_hair_spiked.sps) and other alpha shaders
+            //      need alphaMode set so the glTF material uses the alpha channel
+            bool textureHasAlpha = TextureFormatHasAlpha(tex.Format);
+            bool shaderUsesAlpha = DrawableUsesAlphaShader(drawable);
+
+            // Also scan the actual pixel data for non-opaque alpha values,
+            // but only if the format supports alpha (avoid false positives from DXT1 1-bit alpha)
+            bool hasActualAlphaPixels = false;
+            if (textureHasAlpha && rgbaPixels != null && rgbaPixels.Length > 0)
+            {
+                hasActualAlphaPixels = ScanForAlphaPixels(rgbaPixels, (int)tex.Width, (int)tex.Height);
+            }
+
+            bool needsAlphaMode = textureHasAlpha && (shaderUsesAlpha || hasActualAlphaPixels);
 
             if (rgbaPixels != null && rgbaPixels.Length > 0)
             {
@@ -1037,9 +1069,129 @@ namespace CodeWalker.Export
                     roughnessFactor = 1f,
                 }
             };
+
+            // Set alphaMode for materials that need transparency.
+            // "MASK" = alpha test/cutout — pixels with alpha >= cutoff are fully opaque,
+            // pixels with alpha < cutoff are fully discarded. This matches GTA V's hair
+            // rendering which uses alpha test (HardAlphaBlend / cutout).
+            // "BLEND" = alpha blending — would be needed for glass, etc.
+            if (needsAlphaMode)
+            {
+                mat.alphaMode = "MASK";
+                mat.alphaCutoff = 0.5f;
+                mat.doubleSided = true; // hair/alpha geometry is often double-sided
+            }
+
             int matIdx = ctx.Materials.Count;
             ctx.Materials.Add(mat);
             return matIdx;
+        }
+
+        /// <summary>
+        /// Check if a texture format supports an alpha channel.
+        /// DXT1 does NOT have proper alpha (only 1-bit), DXT3/5, BC7, and ARGB formats do.
+        /// </summary>
+        static bool TextureFormatHasAlpha(TextureFormat format)
+        {
+            switch (format)
+            {
+                // Formats WITH alpha
+                case TextureFormat.D3DFMT_A8R8G8B8:
+                case TextureFormat.D3DFMT_A8B8G8R8:
+                case TextureFormat.D3DFMT_A1R5G5B5:
+                case TextureFormat.D3DFMT_A8:
+                case TextureFormat.D3DFMT_DXT3:
+                case TextureFormat.D3DFMT_DXT5:
+                case TextureFormat.D3DFMT_BC7:
+                    return true;
+                // Formats WITHOUT alpha (or only 1-bit alpha like DXT1)
+                case TextureFormat.D3DFMT_X8R8G8B8:
+                case TextureFormat.D3DFMT_L8:
+                case TextureFormat.D3DFMT_DXT1:
+                case TextureFormat.D3DFMT_ATI1:
+                case TextureFormat.D3DFMT_ATI2:
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// Check if a drawable uses a shader that requires alpha transparency.
+        /// This includes hair shaders (ped_hair_spiked.sps) and other alpha/cutout shaders.
+        /// </summary>
+        static bool DrawableUsesAlphaShader(DrawableBase drawable)
+        {
+            if (drawable == null) return false;
+            var sg = drawable.ShaderGroup;
+            if (sg?.Shaders?.data_items == null) return false;
+
+            foreach (var shader in sg.Shaders.data_items)
+            {
+                if (shader == null) continue;
+                uint hash = shader.FileName.Hash;
+
+                // Hair shader — always uses alpha
+                if (hash == HairShaderHash) return true;
+
+                // Other known alpha/cutout shaders used by ped components.
+                // These shader names contain "alpha" or "cutout" in GTA V's shader files.
+                // Hash values computed from JenkHash of the .sps filename.
+                if (hash == 2865780613u   // ped_default_alpha.sps
+                    || hash == 3176173383u  // ped_default_cutout.sps
+                    || hash == 3190732435u  // cutout_um.sps
+                    || hash == 748520668u   // normal_cutout_um.sps
+                    || hash == 1436689415u  // normal_spec_reflect_emissivenight_alpha.sps
+                    || hash == 179247185u   // emissive_alpha.sps
+                    || hash == 1314864030u  // emissive_alpha_tnt.sps
+                    || hash == 1478174766u  // emissive_additive_alpha.sps
+                    || hash == 3733846327u  // emissivenight_alpha.sps
+                    || hash == 3174327089u  // emissivestrong_alpha.sps
+                    || hash == 3924045432u  // glass_emissive.sps
+                    || hash == 485710087u   // glass_emissivenight_alpha.sps
+                    || hash == 2055615352u  // glass_emissive_alpha.sps
+                    ) return true;
+
+                // Also check HardAlphaBlend shader parameter — if set, the shader uses alpha
+                if (shader.ParametersList?.Parameters != null && shader.ParametersList.Hashes != null)
+                {
+                    var pl = shader.ParametersList.Parameters;
+                    var hl = shader.ParametersList.Hashes;
+                    for (int pi = 0; pi < pl.Length && pi < hl.Length; pi++)
+                    {
+                        if ((uint)hl[pi] == (uint)ShaderParamNames.HardAlphaBlend)
+                        {
+                            if (pl[pi]?.Data is SharpDX.Vector4 v && v.X > 0.0f)
+                                return true;
+                            break;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Scan RGBA pixel data for any non-opaque pixels (alpha &lt; 255).
+        /// Returns true if any pixel has alpha &lt; 250 (with small tolerance for
+        /// compression artifacts in DXT formats).
+        /// Input format: BGRA bytes (4 bytes per pixel, as returned by DDSIO.GetPixels).
+        /// </summary>
+        static bool ScanForAlphaPixels(byte[] rgbaPixels, int width, int height)
+        {
+            int pixelCount = width * height;
+            if (rgbaPixels.Length < pixelCount * 4) return false;
+
+            // Sample pixels (don't check every single one for performance on large textures)
+            int step = Math.Max(1, pixelCount / 10000); // check ~10000 pixels max
+            for (int i = 0; i < pixelCount; i += step)
+            {
+                int offset = i * 4;
+                // BGRA format: offset+3 is alpha
+                byte alpha = rgbaPixels[offset + 3];
+                if (alpha < 250) // tolerance for DXT compression artifacts
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -1117,6 +1269,10 @@ namespace CodeWalker.Export
             // including it gives better local deformation; if not, they stay at bind pose
             // and still follow the body through the parent-child hierarchy.
 
+            // Track which bone tags have rotation channels, so we can copy
+            // ThighRoll rotations from Thigh bones after the main loop.
+            var rotationBoneTags = new HashSet<ushort>();
+
             for (int bi = 0; bi < boneIds.Length; bi++)
             {
                 var boneId = boneIds[bi];
@@ -1124,6 +1280,8 @@ namespace CodeWalker.Export
                 // Do NOT use bone.Index since BoneToNode is keyed by array position,
                 // and bone.Index can differ from array position in GTA V ped skeletons.
                 if (!ctx.BoneTagToNode.TryGetValue(boneId.BoneId, out int nodeIdx)) continue;
+
+                if (boneId.Track == 1) rotationBoneTags.Add(boneId.BoneId);
 
                 if (boneId.Track == 0) // Translation
                 {
@@ -1198,8 +1356,103 @@ namespace CodeWalker.Export
                 }
             }
 
+            // ThighRoll bone rotation copy — replicates the hardcoded hack from
+            // Renderable.cs (lines 517-518). In GTA V, RB_L_ThighRoll and RB_R_ThighRoll
+            // are helper bones that should copy the rotation of their corresponding main
+            // Thigh bone (SKEL_L_Thigh / SKEL_R_Thigh). The animation clips typically
+            // only contain rotation data for the main Thigh bones, not the ThighRoll bones.
+            // Without this, ThighRoll bones stay at bind pose while the thigh animates,
+            // causing the leg to "arch" or appear noodly in Blender.
+            CopyThighRollRotation(ctx, anim, animData, boneIds, timeAcc, frameCount, frameDelta, rotationBoneTags);
+
             if (anim.channels.Count > 0)
                 ctx.Animations.Add(anim);
+        }
+
+        /// <summary>
+        /// Copy rotation animation from main Thigh bones to ThighRoll bones.
+        /// This replicates the hardcoded hack in Renderable.cs (lines 517-528):
+        ///   RB_L_ThighRoll copies rotation from SKEL_L_Thigh
+        ///   RB_R_ThighRoll copies rotation from SKEL_R_Thigh
+        /// The copy only happens if:
+        ///   - The ThighRoll bone exists in the skeleton
+        ///   - The ThighRoll bone does NOT already have its own rotation channel
+        ///   - The Thigh bone HAS rotation data in the clip
+        ///   - The ThighRoll bone's parent is NOT already the Thigh bone
+        ///     (if it is, it inherits the rotation naturally via the hierarchy)
+        /// </summary>
+        static void CopyThighRollRotation(ExportContext ctx, GltfAnimation anim, Animation animData,
+            AnimationBoneId[] boneIds, int timeAcc, int frameCount, float frameDelta,
+            HashSet<ushort> rotationBoneTags)
+        {
+            var bones = ctx.BoneTagToNode; // shorthand
+            var rollMappings = new[]
+            {
+                (rollTag: BoneTag_RB_L_ThighRoll, thighTag: BoneTag_SKEL_L_Thigh),
+                (rollTag: BoneTag_RB_R_ThighRoll, thighTag: BoneTag_SKEL_R_Thigh),
+            };
+
+            foreach (var mapping in rollMappings)
+            {
+                // Both ThighRoll and Thigh must exist in the skeleton
+                if (!bones.TryGetValue(mapping.rollTag, out int rollNodeIdx)) continue;
+                if (!bones.TryGetValue(mapping.thighTag, out int thighNodeIdx)) continue;
+
+                // If ThighRoll already has rotation data from the clip, skip
+                if (rotationBoneTags.Contains(mapping.rollTag)) continue;
+
+                // If Thigh has no rotation data, nothing to copy
+                if (!rotationBoneTags.Contains(mapping.thighTag)) continue;
+
+                // Check if ThighRoll's parent is the Thigh bone — if so, the rotation
+                // is already inherited naturally via the glTF node hierarchy, and we
+                // should NOT copy it (same logic as the renderer's tag != bone.Parent?.Tag check).
+                // We check if the ThighRoll node is a direct child of the Thigh node.
+                bool parentIsThigh = false;
+                if (ctx.NodeChildren.TryGetValue(thighNodeIdx, out var children))
+                {
+                    parentIsThigh = children.Contains(rollNodeIdx);
+                }
+                if (parentIsThigh) continue;
+
+                // Find the bone index in the animation's BoneIds for the Thigh bone
+                int thighBoneIdx = -1;
+                for (int bi = 0; bi < boneIds.Length; bi++)
+                {
+                    if (boneIds[bi].BoneId == mapping.thighTag && boneIds[bi].Track == 1)
+                    {
+                        thighBoneIdx = bi;
+                        break;
+                    }
+                }
+                if (thighBoneIdx < 0) continue;
+
+                // Sample the Thigh rotation at each frame and create a rotation channel for ThighRoll
+                var vals = new List<float>();
+                for (int f = 0; f < frameCount; f++)
+                {
+                    Quaternion val = Quaternion.Identity;
+                    try
+                    {
+                        var fp = animData.GetFramePosition(f * frameDelta);
+                        val = animData.EvaluateQuaternion(fp, thighBoneIdx, true);
+                    }
+                    catch { }
+                    // Y-up LH to Y-up RH quaternion conversion
+                    vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y); vals.Add(val.W);
+                }
+                byte[] vb = new byte[vals.Count * 4];
+                Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                int valBv = ctx.AddBufferView(vb);
+                int valAcc = ctx.AddAccessor(valBv, 5126, "VEC4", frameCount);
+                int sidx = anim.samplers.Count;
+                anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                anim.channels.Add(new GltfAnimationChannel
+                {
+                    sampler = sidx,
+                    target = new GltfAnimationChannelTarget { node = rollNodeIdx, path = "rotation" }
+                });
+            }
         }
 
         #endregion
@@ -1320,7 +1573,21 @@ namespace CodeWalker.Export
                 { sb.Append(",\"baseColorTexture\":{\"index\":"); sb.Append(m.pbrMetallicRoughness.baseColorTexture.index); sb.Append(",\"texCoord\":"); sb.Append(m.pbrMetallicRoughness.baseColorTexture.texCoord); sb.Append("}"); }
                 sb.Append(",\"metallicFactor\":"); sb.Append(FloatStr(m.pbrMetallicRoughness.metallicFactor));
                 sb.Append(",\"roughnessFactor\":"); sb.Append(FloatStr(m.pbrMetallicRoughness.roughnessFactor));
-                sb.Append("}}");
+                sb.Append("}");
+                // Alpha mode — required for hair and other transparent materials
+                if (!string.IsNullOrEmpty(m.alphaMode))
+                {
+                    sb.Append(",\"alphaMode\":"); sb.Append(JsonStr(m.alphaMode));
+                }
+                if (m.alphaCutoff.HasValue)
+                {
+                    sb.Append(",\"alphaCutoff\":"); sb.Append(FloatStr(m.alphaCutoff.Value));
+                }
+                if (m.doubleSided)
+                {
+                    sb.Append(",\"doubleSided\":true");
+                }
+                sb.Append("}");
             }
             sb.Append("],");
 
