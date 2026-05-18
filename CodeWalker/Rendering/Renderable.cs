@@ -600,6 +600,14 @@ namespace CodeWalker.Rendering
                     }
                 }
 
+                // Apply debug bone swap mapping for facial tracks.
+                // This redirects which skeleton bone receives the animation data
+                // without modifying the underlying data structures.
+                if ((track == 24) || (track == 25) || (track == 26))
+                {
+                    boneid = FacialBoneSwapMap.RemapBoneId(boneid);
+                }
+
                 Bone bone = null;
                 skel?.BonesMap?.TryGetValue(boneid, out bone);
                 if (bone == null)

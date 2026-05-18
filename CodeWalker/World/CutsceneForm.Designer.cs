@@ -46,6 +46,7 @@
             this.AudioCheckBox = new System.Windows.Forms.CheckBox();
             this.ExportGltfButton = new System.Windows.Forms.Button();
             this.ExportDebugDataButton = new System.Windows.Forms.Button();
+            this.BoneDebugButton = new System.Windows.Forms.Button();
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).BeginInit();
             this.splitContainer1.Panel1.SuspendLayout();
             this.splitContainer1.Panel2.SuspendLayout();
@@ -240,12 +241,24 @@
             this.ExportDebugDataButton.Text = "Export Debug";
             this.ExportDebugDataButton.UseVisualStyleBackColor = true;
             this.ExportDebugDataButton.Click += new System.EventHandler(this.ExportDebugDataButton_Click);
+            //
+            // BoneDebugButton
+            //
+            this.BoneDebugButton.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
+            this.BoneDebugButton.Location = new System.Drawing.Point(617, 10);
+            this.BoneDebugButton.Name = "BoneDebugButton";
+            this.BoneDebugButton.Size = new System.Drawing.Size(100, 23);
+            this.BoneDebugButton.TabIndex = 16;
+            this.BoneDebugButton.Text = "Bone Debug";
+            this.BoneDebugButton.UseVisualStyleBackColor = true;
+            this.BoneDebugButton.Click += new System.EventHandler(this.BoneDebugButton_Click);
             // 
             // CutsceneForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(724, 461);
+            this.Controls.Add(this.BoneDebugButton);
             this.Controls.Add(this.ExportDebugDataButton);
             this.Controls.Add(this.ExportGltfButton);
             this.Controls.Add(this.VolumeTrackBar);
@@ -294,5 +307,6 @@
         private System.Windows.Forms.CheckBox AudioCheckBox;
         private System.Windows.Forms.Button ExportGltfButton;
         private System.Windows.Forms.Button ExportDebugDataButton;
+        private System.Windows.Forms.Button BoneDebugButton;
     }
 }

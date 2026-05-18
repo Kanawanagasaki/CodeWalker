@@ -2,6 +2,8 @@
 using CodeWalker.GameFiles;
 using CodeWalker.Rendering;
 using CodeWalker.Utils;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using SharpDX;
 using System;
 using System.Collections.Generic;
@@ -638,225 +640,205 @@ namespace CodeWalker.World
             }
         }
 
+        private void BoneDebugButton_Click(object sender, EventArgs e)
+        {
+            if (Cutscene == null)
+            {
+                MessageBox.Show("No cutscene loaded. Please select a cutscene first.", "Bone Debug",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            EnsureCutsceneLoaded();
+
+            if (Cutscene.SceneObjects == null || Cutscene.SceneObjects.Count == 0)
+            {
+                MessageBox.Show("No objects in the cutscene.", "Bone Debug",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            bool hasPed = Cutscene.SceneObjects.Values.Any(o => o.Ped != null);
+            if (!hasPed)
+            {
+                MessageBox.Show("No ped objects in the cutscene. Bone swapping only applies to ped facial bones.", "Bone Debug",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            using (var panel = new BoneSwapDebugPanel(Cutscene))
+            {
+                panel.ShowDialog(this);
+            }
+        }
+
         /// <summary>
         /// Export all cutscene animation data as a JSON file for debugging facial expressions
-        /// and bone animations. The output is an array of frame snapshots, each containing
-        /// every bone track value, expression mapping, and object transform at that timestamp.
+        /// and bone animations. Uses Newtonsoft.Json for proper serialization.
         /// </summary>
         private void ExportDebugData(IEnumerable<CutsceneObject> selectedObjects, string filePath)
         {
-            var sb = new StringBuilder();
-            sb.AppendLine("{");
+            var root = new JObject();
 
             // --- Cutscene metadata ---
-            sb.AppendLine("  \"cutscene\": {");
-            var csName = Cutscene.CutFile?.FileEntry?.GetShortName() ?? "unknown";
-            sb.AppendLine($"    \"name\": {JsonStr(csName)},");
-            sb.AppendLine($"    \"duration\": {JsonFloat(Cutscene.Duration)},");
-            sb.AppendLine($"    \"position\": [{JsonFloat(Cutscene.Position.X)}, {JsonFloat(Cutscene.Position.Y)}, {JsonFloat(Cutscene.Position.Z)}],");
-            sb.AppendLine($"    \"rotation\": [{JsonFloat(Cutscene.Rotation.X)}, {JsonFloat(Cutscene.Rotation.Y)}, {JsonFloat(Cutscene.Rotation.Z)}, {JsonFloat(Cutscene.Rotation.W)}],");
+            var csMeta = new JObject();
+            csMeta["name"] = Cutscene.CutFile?.FileEntry?.GetShortName() ?? "unknown";
+            csMeta["duration"] = Cutscene.Duration;
+            csMeta["position"] = new JArray(Cutscene.Position.X, Cutscene.Position.Y, Cutscene.Position.Z);
+            csMeta["rotation"] = new JArray(Cutscene.Rotation.X, Cutscene.Rotation.Y, Cutscene.Rotation.Z, Cutscene.Rotation.W);
 
-            // Camera cut list
-            sb.Append("    \"cameraCutList\": [");
             if (Cutscene.CameraCutList != null)
             {
-                for (int i = 0; i < Cutscene.CameraCutList.Length; i++)
-                {
-                    if (i > 0) sb.Append(", ");
-                    sb.Append(JsonFloat(Cutscene.CameraCutList[i]));
-                }
+                var cutArr = new JArray();
+                foreach (var t in Cutscene.CameraCutList) cutArr.Add(t);
+                csMeta["cameraCutList"] = cutArr;
             }
-            sb.AppendLine("],");
 
-            // YCD info
-            sb.Append("    \"ycdFiles\": [");
             if (Cutscene.Ycds != null)
             {
-                for (int i = 0; i < Cutscene.Ycds.Length; i++)
-                {
-                    if (i > 0) sb.Append(", ");
-                    var ycd = Cutscene.Ycds[i];
-                    sb.Append(ycd != null ? JsonStr(ycd.Name ?? "") : "null");
-                }
+                var ycdArr = new JArray();
+                foreach (var ycd in Cutscene.Ycds) ycdArr.Add(ycd?.Name ?? null);
+                csMeta["ycdFiles"] = ycdArr;
             }
-            sb.AppendLine("]");
-            sb.AppendLine("  },"); // end cutscene
 
-            // --- Static object info (skeleton, expressions, bone tracks) ---
+            root["cutscene"] = csMeta;
+
+            // --- Static object info ---
             var objList = selectedObjects.ToList();
-            sb.AppendLine("  \"objects\": [");
-            for (int oi = 0; oi < objList.Count; oi++)
+            var objectsArr = new JArray();
+
+            foreach (var obj in objList)
             {
-                var obj = objList[oi];
-                if (oi > 0) sb.AppendLine(",");
-                sb.AppendLine("  {");
-                sb.AppendLine($"    \"objectId\": {obj.ObjectID},");
-                sb.AppendLine($"    \"nameHash\": {obj.Name.Hash},");
-                sb.AppendLine($"    \"animHash\": {obj.AnimHash.Hash},");
-                sb.AppendLine($"    \"enabled\": {JsonBool(obj.Enabled != false)},");
+                var objJson = new JObject();
+                objJson["objectId"] = obj.ObjectID;
+                objJson["nameHash"] = obj.Name.Hash;
+                objJson["animHash"] = obj.AnimHash.Hash;
+                objJson["enabled"] = obj.Enabled != false;
 
-                // Type info
                 string objType = obj.Ped != null ? "Ped" : obj.Prop != null ? "Prop" : obj.Vehicle != null ? "Vehicle" : obj.Weapon != null ? "Weapon" : "Other";
-                sb.AppendLine($"    \"type\": {JsonStr(objType)},");
+                objJson["type"] = objType;
 
-                // --- Ped-specific static data ---
                 if (obj.Ped != null)
                 {
                     var ped = obj.Ped;
-                    sb.AppendLine($"    \"pedName\": {JsonStr(ped.Name ?? "")},");
-                    sb.AppendLine($"    \"pedNameHash\": {ped.NameHash.Hash},");
+                    objJson["pedName"] = ped.Name ?? "";
+                    objJson["pedNameHash"] = ped.NameHash.Hash;
 
                     // Skeleton bones
                     var skeleton = ped.Skeleton;
                     if (skeleton?.BonesMap != null)
                     {
-                        sb.AppendLine("    \"skeleton\": {");
-                        sb.AppendLine($"      \"boneCount\": {skeleton.BonesMap.Count},");
-                        sb.AppendLine("      \"bones\": [");
-                        var bones = skeleton.BonesMap.Values.OrderBy(b => b.Tag).ToList();
-                        for (int bi = 0; bi < bones.Count; bi++)
-                        {
-                            if (bi > 0) sb.AppendLine(",");
-                            var bone = bones[bi];
-                            sb.AppendLine("        {");
-                            sb.AppendLine($"          \"tag\": {bone.Tag},");
-                            sb.AppendLine($"          \"name\": {JsonStr(bone.Name ?? "")},");
-                            sb.AppendLine($"          \"index\": {bone.Index},");
-                            sb.AppendLine($"          \"parentIndex\": {bone.ParentIndex},");
-                            sb.AppendLine($"          \"flags\": {(uint)bone.Flags},");
-                            sb.AppendLine($"          \"bindTranslation\": [{JsonFloat(bone.Translation.X)}, {JsonFloat(bone.Translation.Y)}, {JsonFloat(bone.Translation.Z)}],");
-                            sb.AppendLine($"          \"bindRotation\": [{JsonFloat(bone.Rotation.X)}, {JsonFloat(bone.Rotation.Y)}, {JsonFloat(bone.Rotation.Z)}, {JsonFloat(bone.Rotation.W)}],");
-                            sb.AppendLine($"          \"bindScale\": [{JsonFloat(bone.Scale.X)}, {JsonFloat(bone.Scale.Y)}, {JsonFloat(bone.Scale.Z)}]");
-                            sb.Append("        }");
-                        }
-                        sb.AppendLine();
-                        sb.AppendLine("      ],");
+                        var skelJson = new JObject();
+                        skelJson["boneCount"] = skeleton.BonesMap.Count;
 
-                        // Bone tag to name lookup
-                        sb.AppendLine("      \"boneTagToName\": {");
-                        var boneEntries = skeleton.BonesMap.OrderBy(kv => kv.Key).ToList();
-                        for (int bi = 0; bi < boneEntries.Count; bi++)
+                        var bonesArr = new JArray();
+                        foreach (var bone in skeleton.BonesMap.Values.OrderBy(b => b.Tag))
                         {
-                            if (bi > 0) sb.Append(",");
-                            sb.Append($"        \"{boneEntries[bi].Key}\": {JsonStr(boneEntries[bi].Value.Name ?? "")}");
+                            var bJson = new JObject();
+                            bJson["tag"] = bone.Tag;
+                            bJson["name"] = bone.Name ?? "";
+                            bJson["index"] = bone.Index;
+                            bJson["parentIndex"] = bone.ParentIndex;
+                            bJson["flags"] = (uint)bone.Flags;
+                            bJson["bindTranslation"] = new JArray(bone.Translation.X, bone.Translation.Y, bone.Translation.Z);
+                            bJson["bindRotation"] = new JArray(bone.Rotation.X, bone.Rotation.Y, bone.Rotation.Z, bone.Rotation.W);
+                            bJson["bindScale"] = new JArray(bone.Scale.X, bone.Scale.Y, bone.Scale.Z);
+                            bonesArr.Add(bJson);
                         }
-                        sb.AppendLine();
-                        sb.AppendLine("      }");
-                        sb.AppendLine("    },");
+                        skelJson["bones"] = bonesArr;
+
+                        var tagToName = new JObject();
+                        foreach (var kv in skeleton.BonesMap.OrderBy(kv => kv.Key))
+                        {
+                            tagToName[kv.Key.ToString()] = kv.Value.Name ?? "";
+                        }
+                        skelJson["boneTagToName"] = tagToName;
+
+                        objJson["skeleton"] = skelJson;
                     }
                     else
                     {
-                        sb.AppendLine("    \"skeleton\": null,");
+                        objJson["skeleton"] = null;
                     }
 
-                    // Expression data - global
-                    if (ped.Expression != null)
-                    {
-                        sb.AppendLine("    \"globalExpression\": {");
-                        sb.AppendLine($"      \"name\": {JsonStr(ped.Expression.Name?.Value ?? "")},");
-                        sb.AppendLine($"      \"nameHash\": {ped.Expression.NameHash.Hash},");
-                        WriteExpressionTracksJson(sb, ped.Expression, "      ");
-                        sb.AppendLine("    },");
-                    }
-                    else
-                    {
-                        sb.AppendLine("    \"globalExpression\": null,");
-                    }
+                    // Global expression
+                    objJson["globalExpression"] = ped.Expression != null
+                        ? BuildExpressionJson(ped.Expression)
+                        : null;
 
-                    // Expression data - per-component
-                    sb.AppendLine("    \"componentExpressions\": [");
+                    // Component expressions
+                    var compExprArr = new JArray();
                     string[] compNames = { "Head", "Berd", "Hair", "Uppr", "Lowr", "Hand", "Feet", "Teff", "Accs", "Task", "Decl", "Jbib" };
-                    bool anyCompExpr = false;
                     for (int ci = 0; ci < ped.Expressions.Length; ci++)
                     {
                         var expr = ped.Expressions[ci];
                         if (expr == null) continue;
-                        if (anyCompExpr) sb.AppendLine(",");
-                        anyCompExpr = true;
-                        var drawableName = ped.DrawableNames?[ci] ?? "";
-                        sb.AppendLine("      {");
-                        sb.AppendLine($"        \"componentIndex\": {ci},");
-                        sb.AppendLine($"        \"componentName\": {JsonStr(ci < compNames.Length ? compNames[ci] : $"Comp{ci}")},");
-                        sb.AppendLine($"        \"drawableName\": {JsonStr(drawableName)},");
-                        sb.AppendLine($"        \"expressionName\": {JsonStr(expr.Name?.Value ?? "")},");
-                        sb.AppendLine($"        \"expressionNameHash\": {expr.NameHash.Hash},");
-                        WriteExpressionTracksJson(sb, expr, "        ");
-                        sb.Append("      }");
+
+                        var ceJson = new JObject();
+                        ceJson["componentIndex"] = ci;
+                        ceJson["componentName"] = ci < compNames.Length ? compNames[ci] : $"Comp{ci}";
+                        ceJson["drawableName"] = ped.DrawableNames?[ci] ?? "";
+                        ceJson["expressionName"] = expr.Name?.Value ?? "";
+                        ceJson["expressionNameHash"] = expr.NameHash.Hash;
+                        MergeExpressionTracksJson(ceJson, expr);
+                        compExprArr.Add(ceJson);
                     }
-                    if (anyCompExpr) sb.AppendLine();
-                    sb.AppendLine("    ],");
+                    objJson["componentExpressions"] = compExprArr;
 
                     // Merged BoneTracksDict
                     var mergedDict = BuildMergedBoneTracksDict(ped);
-                    sb.AppendLine("    \"mergedBoneTracksDict\": [");
+                    var mergedArr = new JArray();
                     if (mergedDict != null)
                     {
-                        bool firstEntry = true;
                         foreach (var kvp in mergedDict)
                         {
-                            if (!firstEntry) sb.AppendLine(",");
-                            firstEntry = false;
-                            sb.AppendLine("        {");
-                            sb.AppendLine($"          \"from\": {{ \"boneId\": {kvp.Key.BoneId}, \"track\": {kvp.Key.Track}, \"flags\": {kvp.Key.Flags} }},");
-                            sb.AppendLine($"          \"to\": {{ \"boneId\": {kvp.Value.BoneId}, \"track\": {kvp.Value.Track}, \"flags\": {kvp.Value.Flags} }}");
+                            var mJson = new JObject();
+                            mJson["from"] = new JObject { ["boneId"] = kvp.Key.BoneId, ["track"] = kvp.Key.Track, ["flags"] = kvp.Key.Flags };
+                            mJson["to"] = new JObject { ["boneId"] = kvp.Value.BoneId, ["track"] = kvp.Value.Track, ["flags"] = kvp.Value.Flags };
 
-                            // Resolve bone name if possible
-                            string fromName = "";
-                            string toName = "";
-                            if (ped.Skeleton?.BonesMap != null)
-                            {
-                                if (ped.Skeleton.BonesMap.TryGetValue(kvp.Value.BoneId, out var toBone))
-                                    toName = toBone.Name ?? "";
-                            }
-                            if (toName != "")
-                            {
-                                sb.AppendLine($",          \"toBoneName\": {JsonStr(toName)}");
-                            }
+                            if (ped.Skeleton?.BonesMap != null && ped.Skeleton.BonesMap.TryGetValue(kvp.Value.BoneId, out var toBone))
+                                mJson["toBoneName"] = toBone.Name ?? "";
 
-                            sb.Append("        }");
+                            mergedArr.Add(mJson);
                         }
-                        if (!firstEntry) sb.AppendLine();
                     }
-                    sb.AppendLine("    ],");
+                    objJson["mergedBoneTracksDict"] = mergedArr;
 
-                    // Animation clip static info - all bone IDs and track descriptions
+                    // Animation clip static info
                     var animClip = obj.AnimClip ?? ped.AnimClip;
                     if (animClip != null)
                     {
-                        sb.AppendLine("    \"animClip\": {");
-                        sb.AppendLine($"      \"hash\": {animClip.Hash.Hash},");
-                        sb.AppendLine($"      \"clipType\": {JsonStr(animClip.Clip?.GetType().Name ?? "null")},");
+                        var acJson = new JObject();
+                        acJson["hash"] = animClip.Hash.Hash;
+                        acJson["clipType"] = animClip.Clip?.GetType().Name ?? "null";
 
                         var subAnims = GetSubAnimations(animClip);
-                        sb.AppendLine($"      \"subAnimationCount\": {subAnims.Count},");
+                        acJson["subAnimationCount"] = subAnims.Count;
 
-                        // Dump all AnimationBoneId entries for each sub-animation
-                        sb.AppendLine("      \"subAnimations\": [");
-                        for (int si = 0; si < subAnims.Count; si++)
+                        var subArr = new JArray();
+                        foreach (var sa in subAnims)
                         {
-                            if (si > 0) sb.AppendLine(",");
-                            var sa = subAnims[si];
-                            sb.AppendLine("        {");
-                            sb.AppendLine($"          \"startTime\": {JsonFloat(sa.StartTime)},");
-                            sb.AppendLine($"          \"endTime\": {JsonFloat(sa.EndTime)},");
-                            sb.AppendLine($"          \"duration\": {JsonFloat(sa.Animation.Duration)},");
-                            sb.AppendLine($"          \"frames\": {sa.Animation.Frames},");
-                            sb.AppendLine($"          \"sequenceFrameLimit\": {sa.Animation.SequenceFrameLimit},");
+                            var saJson = new JObject();
+                            saJson["startTime"] = sa.StartTime;
+                            saJson["endTime"] = sa.EndTime;
+                            saJson["duration"] = sa.Animation.Duration;
+                            saJson["frames"] = sa.Animation.Frames;
+                            saJson["sequenceFrameLimit"] = sa.Animation.SequenceFrameLimit;
 
                             var boneIds = sa.Animation.BoneIds?.data_items;
                             if (boneIds != null)
                             {
-                                sb.AppendLine($"          \"boneIdCount\": {boneIds.Length},");
-                                sb.AppendLine("          \"boneIds\": [");
-                                for (int bi = 0; bi < boneIds.Length; bi++)
+                                saJson["boneIdCount"] = boneIds.Length;
+                                var bidArr = new JArray();
+                                foreach (var bid in boneIds)
                                 {
-                                    if (bi > 0) sb.AppendLine(",");
-                                    var bid = boneIds[bi];
-                                    string trackName = GetTrackName(bid.Track);
-                                    string boneName = "";
-                                    ushort effectiveBoneId = bid.BoneId;
+                                    var bidJson = new JObject();
+                                    bidJson["boneId"] = bid.BoneId;
+                                    bidJson["track"] = bid.Track;
+                                    bidJson["trackName"] = GetTrackName(bid.Track);
+                                    bidJson["unk0"] = bid.Unk0;
 
-                                    // Apply expression remapping for facial tracks
+                                    ushort effectiveBoneId = bid.BoneId;
                                     if (bid.Track == 24 || bid.Track == 25 || bid.Track == 26)
                                     {
                                         if (mergedDict != null)
@@ -866,100 +848,93 @@ namespace CodeWalker.World
                                                 effectiveBoneId = mapped.BoneId;
                                         }
                                     }
+                                    bidJson["effectiveBoneId"] = effectiveBoneId;
 
+                                    string boneName = "";
                                     if (ped.Skeleton?.BonesMap != null)
                                     {
                                         ushort lookupId = (bid.Track == 24 || bid.Track == 25 || bid.Track == 26) ? effectiveBoneId : bid.BoneId;
                                         if (ped.Skeleton.BonesMap.TryGetValue(lookupId, out var b))
                                             boneName = b.Name ?? "";
                                     }
+                                    bidJson["boneName"] = boneName;
 
-                                    sb.AppendLine($"            {{ \"boneId\": {bid.BoneId}, \"track\": {bid.Track}, \"trackName\": {JsonStr(trackName)}, \"unk0\": {bid.Unk0}, \"effectiveBoneId\": {effectiveBoneId}, \"boneName\": {JsonStr(boneName)} }}");
+                                    bidArr.Add(bidJson);
                                 }
-                                sb.AppendLine();
-                                sb.AppendLine("          ]");
+                                saJson["boneIds"] = bidArr;
                             }
                             else
                             {
-                                sb.AppendLine("          \"boneIdCount\": 0,");
-                                sb.AppendLine("          \"boneIds\": []");
+                                saJson["boneIdCount"] = 0;
+                                saJson["boneIds"] = new JArray();
                             }
 
-                            sb.Append("        }");
+                            subArr.Add(saJson);
                         }
-                        if (subAnims.Count > 0) sb.AppendLine();
-                        sb.AppendLine("      ]");
-                        sb.AppendLine("    },");
+                        acJson["subAnimations"] = subArr;
+                        objJson["animClip"] = acJson;
                     }
                     else
                     {
-                        sb.AppendLine("    \"animClip\": null,");
+                        objJson["animClip"] = null;
                     }
                 }
 
-                // Remove trailing comma from last property
-                sb.AppendLine("    \"position\": [0, 0, 0],");
-                sb.AppendLine("    \"rotation\": [0, 0, 0, 1]");
-                sb.Append("  }");
+                objJson["position"] = new JArray(0, 0, 0);
+                objJson["rotation"] = new JArray(0, 0, 0, 1);
+                objectsArr.Add(objJson);
             }
-            sb.AppendLine();
-            sb.AppendLine("  ],"); // end objects
+            root["objects"] = objectsArr;
 
-            // --- Frame data: array of snapshots at each frame ---
-            sb.AppendLine("  \"frames\": [");
-
+            // --- Frame data ---
             float duration = Cutscene.Duration;
-            // Sample at 30fps, or use animation frame count if available
             float fps = 30.0f;
             int totalFrames = (int)Math.Ceiling(duration * fps);
             if (totalFrames < 1) totalFrames = 1;
             float frameDelta = duration / totalFrames;
 
+            var framesArr = new JArray();
+
             for (int frameIdx = 0; frameIdx <= totalFrames; frameIdx++)
             {
-                if (frameIdx > 0) sb.AppendLine(",");
                 float time = Math.Min(frameIdx * frameDelta, duration);
+                var frameJson = new JObject();
+                frameJson["time"] = time;
+                frameJson["frameIndex"] = frameIdx;
 
-                sb.AppendLine("    {");
-                sb.AppendLine($"      \"time\": {JsonFloat(time)},");
-                sb.AppendLine($"      \"frameIndex\": {frameIdx},");
-
-                // Camera data at this time
+                // Camera data
                 var camObj = Cutscene.CameraObject;
                 if (camObj != null)
                 {
-                    sb.AppendLine("      \"camera\": {");
-                    sb.AppendLine($"        \"position\": [{JsonFloat(camObj.Position.X)}, {JsonFloat(camObj.Position.Y)}, {JsonFloat(camObj.Position.Z)}],");
-                    sb.AppendLine($"        \"rotation\": [{JsonFloat(camObj.Rotation.X)}, {JsonFloat(camObj.Rotation.Y)}, {JsonFloat(camObj.Rotation.Z)}, {JsonFloat(camObj.Rotation.W)}]");
-                    sb.AppendLine("      },");
+                    var camJson = new JObject();
+                    camJson["position"] = new JArray(camObj.Position.X, camObj.Position.Y, camObj.Position.Z);
+                    camJson["rotation"] = new JArray(camObj.Rotation.X, camObj.Rotation.Y, camObj.Rotation.Z, camObj.Rotation.W);
+                    frameJson["camera"] = camJson;
                 }
 
-                // Determine current camera cut and YCD
+                // Camera cut info
                 int cutIndex = 0;
                 float cutStart = 0.0f;
                 for (cutIndex = 0; cutIndex < Cutscene.CameraCutList?.Length; cutIndex++)
                 {
-                    var cutTime = Cutscene.CameraCutList[cutIndex];
-                    if (cutTime > time) break;
-                    cutStart = cutTime;
+                    if (Cutscene.CameraCutList[cutIndex] > time) break;
+                    cutStart = Cutscene.CameraCutList[cutIndex];
                 }
                 float cutOffset = time - cutStart;
 
-                sb.AppendLine("      \"cutIndex\": {cutIndex},");
-                sb.AppendLine($"      \"cutOffset\": {JsonFloat(cutOffset)},");
-                sb.AppendLine("      \"objects\": [");
+                frameJson["cutIndex"] = cutIndex;
+                frameJson["cutOffset"] = cutOffset;
 
-                for (int oi = 0; oi < objList.Count; oi++)
+                // Per-object frame data
+                var frameObjs = new JArray();
+                foreach (var obj in objList)
                 {
-                    var obj = objList[oi];
-                    if (oi > 0) sb.AppendLine(",");
+                    var foJson = new JObject();
+                    foJson["objectId"] = obj.ObjectID;
+                    foJson["nameHash"] = obj.Name.Hash;
+                    foJson["enabled"] = obj.Enabled != false;
 
-                    sb.AppendLine("        {");
-                    sb.AppendLine($"          \"objectId\": {obj.ObjectID},");
-                    sb.AppendLine($"          \"nameHash\": {obj.Name.Hash},");
-                    sb.AppendLine($"          \"enabled\": {JsonBool(obj.Enabled != false)},");
-
-                    // Evaluate object position/rotation at this time
+                    // Evaluate object position/rotation
                     var ycd = (cutIndex < (Cutscene.Ycds?.Length ?? 0)) ? Cutscene.Ycds[cutIndex] : null;
                     ClipMapEntry cme = null;
                     ycd?.CutsceneMap?.TryGetValue(obj.AnimHash, out cme);
@@ -969,34 +944,28 @@ namespace CodeWalker.World
 
                     if (cme != null)
                     {
-                        // Evaluate root tracks (5=position, 6=rotation)
                         EvaluateClipTransform(cme, cutOffset, 0, 5, 6, ref objPos, ref objRot);
-
-                        // Apply world transform
                         var worldPos = Cutscene.Position + Cutscene.Rotation.Multiply(objPos);
                         var worldRot = Cutscene.Rotation * objRot;
                         objPos = worldPos;
                         objRot = worldRot;
                     }
 
-                    sb.AppendLine($"          \"position\": [{JsonFloat(objPos.X)}, {JsonFloat(objPos.Y)}, {JsonFloat(objPos.Z)}],");
-                    sb.AppendLine($"          \"rotation\": [{JsonFloat(objRot.X)}, {JsonFloat(objRot.Y)}, {JsonFloat(objRot.Z)}, {JsonFloat(objRot.W)}],");
+                    foJson["position"] = new JArray(objPos.X, objPos.Y, objPos.Z);
+                    foJson["rotation"] = new JArray(objRot.X, objRot.Y, objRot.Z, objRot.W);
 
-                    // Ped-specific frame data
+                    // Ped-specific bone tracks
                     if (obj.Ped != null)
                     {
                         var ped = obj.Ped;
                         var animClip = obj.AnimClip ?? ped.AnimClip;
                         var mergedDict2 = BuildMergedBoneTracksDict(ped);
 
-                        // Evaluate all animation bone tracks at this time
-                        sb.AppendLine("          \"boneTracks\": [");
+                        var boneTracksArr = new JArray();
 
                         if (animClip != null)
                         {
                             var subAnims = GetSubAnimations(animClip);
-                            bool firstTrack = true;
-
                             foreach (var subAnim in subAnims)
                             {
                                 var animData = subAnim.Animation;
@@ -1009,14 +978,15 @@ namespace CodeWalker.World
                                 for (int bi = 0; bi < boneIds.Length; bi++)
                                 {
                                     var bid = boneIds[bi];
-                                    if (!firstTrack) sb.AppendLine(",");
-                                    firstTrack = false;
+                                    var btJson = new JObject();
+                                    btJson["boneId"] = bid.BoneId;
+                                    btJson["track"] = bid.Track;
+                                    btJson["trackName"] = GetTrackName(bid.Track);
+                                    btJson["unk0"] = bid.Unk0;
 
                                     ushort effectiveBoneId = bid.BoneId;
-                                    string boneName = "";
                                     bool wasRemapped = false;
 
-                                    // Apply expression remapping for facial tracks
                                     if (bid.Track == 24 || bid.Track == 25 || bid.Track == 26)
                                     {
                                         if (mergedDict2 != null)
@@ -1029,146 +999,196 @@ namespace CodeWalker.World
                                             }
                                         }
                                     }
+                                    btJson["effectiveBoneId"] = effectiveBoneId;
+                                    btJson["wasRemapped"] = wasRemapped;
 
+                                    string boneName = "";
                                     if (ped.Skeleton?.BonesMap != null)
                                     {
                                         ushort lookupId = (bid.Track == 24 || bid.Track == 25 || bid.Track == 26) ? effectiveBoneId : bid.BoneId;
                                         if (ped.Skeleton.BonesMap.TryGetValue(lookupId, out var b))
                                             boneName = b.Name ?? "";
                                     }
+                                    btJson["boneName"] = boneName;
 
-                                    sb.AppendLine("            {");
-                                    sb.AppendLine($"              \"boneId\": {bid.BoneId},");
-                                    sb.AppendLine($"              \"track\": {bid.Track},");
-                                    sb.AppendLine($"              \"trackName\": {JsonStr(GetTrackName(bid.Track))},");
-                                    sb.AppendLine($"              \"unk0\": {bid.Unk0},");
-                                    sb.AppendLine($"              \"effectiveBoneId\": {effectiveBoneId},");
-                                    sb.AppendLine($"              \"wasRemapped\": {JsonBool(wasRemapped)},");
-                                    sb.AppendLine($"              \"boneName\": {JsonStr(boneName)},");
-
-                                    // Evaluate raw animation value
                                     try
                                     {
-                                        if (bid.Track == 1 || bid.Track == 26) // Rotation tracks
+                                        if (bid.Track == 1 || bid.Track == 26)
                                         {
                                             var q = animData.EvaluateQuaternion(fp, bi, true);
-                                            sb.AppendLine($"              \"valueType\": \"quaternion\",");
-                                            sb.AppendLine($"              \"value\": [{JsonFloat(q.X)}, {JsonFloat(q.Y)}, {JsonFloat(q.Z)}, {JsonFloat(q.W)}],");
+                                            btJson["valueType"] = "quaternion";
+                                            btJson["value"] = new JArray(q.X, q.Y, q.Z, q.W);
 
-                                            // For facial tracks, also compute the final animated value
                                             if (bid.Track == 26 && ped.Skeleton?.BonesMap != null && ped.Skeleton.BonesMap.TryGetValue(effectiveBoneId, out var bone))
                                             {
                                                 var animRot = bone.Rotation * q;
-                                                sb.AppendLine($"              \"finalRotation\": [{JsonFloat(animRot.X)}, {JsonFloat(animRot.Y)}, {JsonFloat(animRot.Z)}, {JsonFloat(animRot.W)}],");
-                                                sb.AppendLine($"              \"bindRotation\": [{JsonFloat(bone.Rotation.X)}, {JsonFloat(bone.Rotation.Y)}, {JsonFloat(bone.Rotation.Z)}, {JsonFloat(bone.Rotation.W)}],");
+                                                btJson["finalRotation"] = new JArray(animRot.X, animRot.Y, animRot.Z, animRot.W);
+                                                btJson["bindRotation"] = new JArray(bone.Rotation.X, bone.Rotation.Y, bone.Rotation.Z, bone.Rotation.W);
                                                 var diffQ = Quaternion.Invert(bone.Rotation) * animRot;
-                                                sb.AppendLine($"              \"deltaFromBind\": [{JsonFloat(diffQ.X)}, {JsonFloat(diffQ.Y)}, {JsonFloat(diffQ.Z)}, {JsonFloat(diffQ.W)}]");
+                                                btJson["deltaFromBind"] = new JArray(diffQ.X, diffQ.Y, diffQ.Z, diffQ.W);
                                             }
                                             else
                                             {
-                                                sb.AppendLine($"              \"finalRotation\": null");
+                                                btJson["finalRotation"] = null;
                                             }
                                         }
-                                        else if (bid.Track == 25) // Face rotation Euler
+                                        else if (bid.Track == 25)
                                         {
                                             var v4 = animData.EvaluateVector4(fp, bi, true);
                                             float mult = -0.314159265f;
                                             var q = Quaternion.RotationYawPitchRoll(v4.Z * mult, v4.Y * mult, v4.X * mult);
-                                            sb.AppendLine($"              \"valueType\": \"eulerFaceRot\",");
-                                            sb.AppendLine($"              \"rawValue\": [{JsonFloat(v4.X)}, {JsonFloat(v4.Y)}, {JsonFloat(v4.Z)}, {JsonFloat(v4.W)}],");
-                                            sb.AppendLine($"              \"convertedQuaternion\": [{JsonFloat(q.X)}, {JsonFloat(q.Y)}, {JsonFloat(q.Z)}, {JsonFloat(q.W)}],");
+                                            btJson["valueType"] = "eulerFaceRot";
+                                            btJson["rawValue"] = new JArray(v4.X, v4.Y, v4.Z, v4.W);
+                                            btJson["convertedQuaternion"] = new JArray(q.X, q.Y, q.Z, q.W);
 
                                             if (ped.Skeleton?.BonesMap != null && ped.Skeleton.BonesMap.TryGetValue(effectiveBoneId, out var bone))
                                             {
                                                 var animRot = bone.Rotation * q;
-                                                sb.AppendLine($"              \"finalRotation\": [{JsonFloat(animRot.X)}, {JsonFloat(animRot.Y)}, {JsonFloat(animRot.Z)}, {JsonFloat(animRot.W)}],");
-                                                sb.AppendLine($"              \"bindRotation\": [{JsonFloat(bone.Rotation.X)}, {JsonFloat(bone.Rotation.Y)}, {JsonFloat(bone.Rotation.Z)}, {JsonFloat(bone.Rotation.W)}],");
+                                                btJson["finalRotation"] = new JArray(animRot.X, animRot.Y, animRot.Z, animRot.W);
+                                                btJson["bindRotation"] = new JArray(bone.Rotation.X, bone.Rotation.Y, bone.Rotation.Z, bone.Rotation.W);
                                                 var diffQ = Quaternion.Invert(bone.Rotation) * animRot;
-                                                sb.AppendLine($"              \"deltaFromBind\": [{JsonFloat(diffQ.X)}, {JsonFloat(diffQ.Y)}, {JsonFloat(diffQ.Z)}, {JsonFloat(diffQ.W)}]");
+                                                btJson["deltaFromBind"] = new JArray(diffQ.X, diffQ.Y, diffQ.Z, diffQ.W);
                                             }
                                             else
                                             {
-                                                sb.AppendLine($"              \"finalRotation\": null");
+                                                btJson["finalRotation"] = null;
                                             }
                                         }
-                                        else if (bid.Track == 24) // Face translation
+                                        else if (bid.Track == 24)
                                         {
                                             var v4 = animData.EvaluateVector4(fp, bi, true);
-                                            sb.AppendLine($"              \"valueType\": \"faceTranslation\",");
-                                            sb.AppendLine($"              \"rawValue\": [{JsonFloat(v4.X)}, {JsonFloat(v4.Y)}, {JsonFloat(v4.Z)}, {JsonFloat(v4.W)}],");
+                                            btJson["valueType"] = "faceTranslation";
+                                            btJson["rawValue"] = new JArray(v4.X, v4.Y, v4.Z, v4.W);
 
                                             if (ped.Skeleton?.BonesMap != null && ped.Skeleton.BonesMap.TryGetValue(effectiveBoneId, out var bone))
                                             {
                                                 var fv = new Vector3(0, v4.X * 0.005f, 0);
                                                 var animTrans = bone.Translation + bone.Rotation.Multiply(fv);
-                                                sb.AppendLine($"              \"finalTranslation\": [{JsonFloat(animTrans.X)}, {JsonFloat(animTrans.Y)}, {JsonFloat(animTrans.Z)}],");
-                                                sb.AppendLine($"              \"bindTranslation\": [{JsonFloat(bone.Translation.X)}, {JsonFloat(bone.Translation.Y)}, {JsonFloat(bone.Translation.Z)}],");
+                                                btJson["finalTranslation"] = new JArray(animTrans.X, animTrans.Y, animTrans.Z);
+                                                btJson["bindTranslation"] = new JArray(bone.Translation.X, bone.Translation.Y, bone.Translation.Z);
                                                 var delta = animTrans - bone.Translation;
-                                                sb.AppendLine($"              \"deltaFromBind\": [{JsonFloat(delta.X)}, {JsonFloat(delta.Y)}, {JsonFloat(delta.Z)}]");
+                                                btJson["deltaFromBind"] = new JArray(delta.X, delta.Y, delta.Z);
                                             }
                                             else
                                             {
-                                                sb.AppendLine($"              \"finalTranslation\": null");
+                                                btJson["finalTranslation"] = null;
                                             }
                                         }
-                                        else // Translation, Scale, and other vector tracks
+                                        else
                                         {
                                             var v4 = animData.EvaluateVector4(fp, bi, true);
-                                            sb.AppendLine($"              \"valueType\": \"vector\",");
-                                            sb.AppendLine($"              \"value\": [{JsonFloat(v4.X)}, {JsonFloat(v4.Y)}, {JsonFloat(v4.Z)}, {JsonFloat(v4.W)}]");
+                                            btJson["valueType"] = "vector";
+                                            btJson["value"] = new JArray(v4.X, v4.Y, v4.Z, v4.W);
                                         }
                                     }
                                     catch (Exception ex)
                                     {
-                                        sb.AppendLine($"              \"valueType\": \"error\",");
-                                        sb.AppendLine($"              \"error\": {JsonStr(ex.Message)}");
+                                        btJson["valueType"] = "error";
+                                        btJson["error"] = ex.Message;
                                     }
 
-                                    sb.Append("            }");
+                                    boneTracksArr.Add(btJson);
                                 }
                             }
-                            if (!firstTrack) sb.AppendLine();
                         }
+                        foJson["boneTracks"] = boneTracksArr;
 
-                        sb.AppendLine("          ],"); // end boneTracks
-
-                        // Also dump the full skeleton animated state if we can
-                        sb.AppendLine("          \"skeletonBoneStates\": [");
+                        // Full skeleton animated state
+                        var skelStatesArr = new JArray();
                         if (ped.Skeleton?.BonesMap != null && animClip != null)
                         {
-                            // Compute animated bone transforms for the full skeleton
                             var boneStates = EvaluateFullSkeleton(ped, animClip, cutOffset, mergedDict2);
-                            bool firstBone = true;
                             foreach (var bs in boneStates.OrderBy(b => b.Tag))
                             {
-                                if (!firstBone) sb.AppendLine(",");
-                                sb.AppendLine("            {");
-                                sb.AppendLine($"              \"tag\": {bs.Tag},");
-                                sb.AppendLine($"              \"name\": {JsonStr(bs.Name)},");
-                                sb.AppendLine($"              \"animTranslation\": [{JsonFloat(bs.AnimTranslation.X)}, {JsonFloat(bs.AnimTranslation.Y)}, {JsonFloat(bs.AnimTranslation.Z)}],");
-                                sb.AppendLine($"              \"animRotation\": [{JsonFloat(bs.AnimRotation.X)}, {JsonFloat(bs.AnimRotation.Y)}, {JsonFloat(bs.AnimRotation.Z)}, {JsonFloat(bs.AnimRotation.W)}],");
-                                sb.AppendLine($"              \"animScale\": [{JsonFloat(bs.AnimScale.X)}, {JsonFloat(bs.AnimScale.Y)}, {JsonFloat(bs.AnimScale.Z)}]");
-                                sb.Append("            }");
-                                firstBone = false;
+                                var bsJson = new JObject();
+                                bsJson["tag"] = bs.Tag;
+                                bsJson["name"] = bs.Name;
+                                bsJson["animTranslation"] = new JArray(bs.AnimTranslation.X, bs.AnimTranslation.Y, bs.AnimTranslation.Z);
+                                bsJson["animRotation"] = new JArray(bs.AnimRotation.X, bs.AnimRotation.Y, bs.AnimRotation.Z, bs.AnimRotation.W);
+                                bsJson["animScale"] = new JArray(bs.AnimScale.X, bs.AnimScale.Y, bs.AnimScale.Z);
+                                skelStatesArr.Add(bsJson);
                             }
-                            if (!firstBone) sb.AppendLine();
                         }
-                        sb.AppendLine("          ]");
+                        foJson["skeletonBoneStates"] = skelStatesArr;
                     }
 
-                    sb.Append("        }");
+                    frameObjs.Add(foJson);
                 }
-                sb.AppendLine();
-                sb.Append("      ]"); // end objects
-
-                sb.Append("    }"); // end frame
+                frameJson["objects"] = frameObjs;
+                framesArr.Add(frameJson);
             }
-            sb.AppendLine();
-            sb.AppendLine("  ]"); // end frames
+            root["frames"] = framesArr;
 
-            sb.AppendLine("}"); // end root
+            // Write with proper formatting
+            var settings = new JsonSerializerSettings
+            {
+                Formatting = Formatting.Indented,
+                NullValueHandling = NullValueHandling.Include
+            };
+            var jsonStr = JsonConvert.SerializeObject(root, settings);
+            File.WriteAllText(filePath, jsonStr, Encoding.UTF8);
+        }
 
-            File.WriteAllText(filePath, sb.ToString(), Encoding.UTF8);
+        /// <summary>
+        /// Build a JObject representing an Expression's static data.
+        /// </summary>
+        private JObject BuildExpressionJson(Expression expr)
+        {
+            var json = new JObject();
+            json["name"] = expr.Name?.Value ?? "";
+            json["nameHash"] = expr.NameHash.Hash;
+            MergeExpressionTracksJson(json, expr);
+            return json;
+        }
+
+        /// <summary>
+        /// Merge expression track data (Tracks, BoneTracksDict, etc.) into an existing JObject.
+        /// </summary>
+        private static void MergeExpressionTracksJson(JObject json, Expression expr)
+        {
+            var tracks = expr.Tracks?.data_items;
+            json["trackCount"] = tracks?.Length ?? 0;
+
+            var tracksArr = new JArray();
+            if (tracks != null)
+            {
+                foreach (var t in tracks)
+                {
+                    var tJson = new JObject();
+                    tJson["boneId"] = t.BoneId;
+                    tJson["track"] = t.Track;
+                    tJson["flags"] = t.Flags;
+                    tJson["format"] = t.Format;
+                    tJson["unkFlag"] = t.UnkFlag;
+                    tracksArr.Add(tJson);
+                }
+            }
+            json["tracks"] = tracksArr;
+
+            var btdArr = new JArray();
+            if (expr.BoneTracksDict != null)
+            {
+                foreach (var kvp in expr.BoneTracksDict)
+                {
+                    var mJson = new JObject();
+                    mJson["from"] = new JObject { ["boneId"] = kvp.Key.BoneId, ["track"] = kvp.Key.Track, ["flags"] = kvp.Key.Flags };
+                    mJson["to"] = new JObject { ["boneId"] = kvp.Value.BoneId, ["track"] = kvp.Value.Track, ["flags"] = kvp.Value.Flags };
+                    btdArr.Add(mJson);
+                }
+            }
+            json["boneTracksDict"] = btdArr;
+
+            json["streamCount"] = expr.Streams?.data_items?.Length ?? 0;
+
+            var vars = expr.Variables?.data_items;
+            var varsArr = new JArray();
+            if (vars != null)
+            {
+                foreach (var v in vars) varsArr.Add(v.Hash);
+            }
+            json["variables"] = varsArr;
+            json["signature"] = expr.Signature;
+            json["unknown7C"] = expr.Unknown_7C;
         }
 
         /// <summary>
@@ -1411,96 +1431,6 @@ namespace CodeWalker.World
             }
         }
 
-        /// <summary>
-        /// Write expression track data (Tracks array and BoneTracksDict) as JSON.
-        /// </summary>
-        private static void WriteExpressionTracksJson(StringBuilder sb, Expression expr, string indent)
-        {
-            var tracks = expr.Tracks?.data_items;
-            sb.AppendLine($"{indent}\"trackCount\": {tracks?.Length ?? 0},");
-            sb.AppendLine($"{indent}\"tracks\": [");
-            if (tracks != null)
-            {
-                for (int i = 0; i < tracks.Length; i++)
-                {
-                    if (i > 0) sb.AppendLine(",");
-                    var t = tracks[i];
-                    sb.Append($"{indent}  {{ \"boneId\": {t.BoneId}, \"track\": {t.Track}, \"flags\": {t.Flags}, \"format\": {t.Format}, \"unkFlag\": {t.UnkFlag} }}");
-                }
-                if (tracks.Length > 0) sb.AppendLine();
-            }
-            sb.AppendLine($"{indent}],");
-
-            // BoneTracksDict
-            sb.AppendLine($"{indent}\"boneTracksDict\": [");
-            if (expr.BoneTracksDict != null)
-            {
-                bool first = true;
-                foreach (var kvp in expr.BoneTracksDict)
-                {
-                    if (!first) sb.AppendLine(",");
-                    first = false;
-                    sb.Append($"{indent}  {{ \"from\": {{ \"boneId\": {kvp.Key.BoneId}, \"track\": {kvp.Key.Track}, \"flags\": {kvp.Key.Flags} }}, \"to\": {{ \"boneId\": {kvp.Value.BoneId}, \"track\": {kvp.Value.Track}, \"flags\": {kvp.Value.Flags} }} }}");
-                }
-                if (!first) sb.AppendLine();
-            }
-            sb.AppendLine($"{indent}],");
-
-            // Stream count and variable names
-            sb.AppendLine($"{indent}\"streamCount\": {expr.Streams?.data_items?.Length ?? 0},");
-            var vars = expr.Variables?.data_items;
-            sb.Append($"{indent}\"variables\": [");
-            if (vars != null)
-            {
-                for (int i = 0; i < vars.Length; i++)
-                {
-                    if (i > 0) sb.Append(", ");
-                    sb.Append($"{vars[i].Hash}");
-                }
-            }
-            sb.AppendLine("],");
-            sb.AppendLine($"{indent}\"signature\": {expr.Signature},");
-            sb.AppendLine($"{indent}\"unknown7C\": {expr.Unknown_7C}");
-        }
-
-        // JSON helper methods
-        private static string JsonStr(string s)
-        {
-            if (s == null) return "null";
-            var sb = new StringBuilder();
-            sb.Append('"');
-            foreach (char c in s)
-            {
-                switch (c)
-                {
-                    case '"': sb.Append("\\\""); break;
-                    case '\\': sb.Append("\\\\"); break;
-                    case '\b': sb.Append("\\b"); break;
-                    case '\f': sb.Append("\\f"); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
-                    default:
-                        if (c < 32)
-                            sb.Append($"\\u{(int)c:X4}");
-                        else
-                            sb.Append(c);
-                        break;
-                }
-            }
-            sb.Append('"');
-            return sb.ToString();
-        }
-
-        private static string JsonFloat(float v)
-        {
-            if (float.IsNaN(v)) return "\"NaN\"";
-            if (float.IsPositiveInfinity(v)) return "\"Inf\"";
-            if (float.IsNegativeInfinity(v)) return "\"-Inf\"";
-            return v.ToString("G9", System.Globalization.CultureInfo.InvariantCulture);
-        }
-
-        private static string JsonBool(bool v) => v ? "true" : "false";
     }
 
 
