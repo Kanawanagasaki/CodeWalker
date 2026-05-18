@@ -80,7 +80,7 @@ namespace CodeWalker.Export
                 if (animClip != null)
                 {
                     string animName = pedData.Armature.Ped.Name ?? ("Ped_" + pedData.CutsceneObject.ObjectID);
-                    GltfWriter.BuildPedAnimation(ctx, pedData.Armature, animClip, animName);
+                    GltfWriter.BuildPedAnimation(ctx, pedData.Armature, animClip, animName, pedData.Armature.Ped.Expression);
                 }
             }
 

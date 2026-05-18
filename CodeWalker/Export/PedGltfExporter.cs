@@ -18,7 +18,7 @@ namespace CodeWalker.Export
             var pedData = GltfWriter.BuildPedArmature(ctx, ped, ped.Name ?? "Ped", null, null, null, -1);
             GltfWriter.BuildPedMeshes(ctx, ped, pedData, "");
             if (ped.AnimClip != null)
-                GltfWriter.BuildPedAnimation(ctx, pedData, ped.AnimClip, ped.Name ?? "Ped");
+                GltfWriter.BuildPedAnimation(ctx, pedData, ped.AnimClip, ped.Name ?? "Ped", ped.Expression);
 
             if (isGlb) GltfWriter.WriteGlb(ctx, filePath);
             else GltfWriter.WriteGltf(ctx, filePath);

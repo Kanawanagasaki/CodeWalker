@@ -632,7 +632,8 @@ namespace CodeWalker.Export
         /// <param name="pedData">Per-ped armature data from BuildPedArmature</param>
         /// <param name="animClip">The animation clip to export</param>
         /// <param name="animName">Name for the animation</param>
-        public static void BuildPedAnimation(ExportContext ctx, PedArmatureData pedData, ClipMapEntry animClip, string animName)
+        /// <param name="expression">Optional Expression for facial bone remapping (tracks 24/25/26). Can be null.</param>
+        public static void BuildPedAnimation(ExportContext ctx, PedArmatureData pedData, ClipMapEntry animClip, string animName, Expression expression = null)
         {
             if (animClip?.Clip == null) return;
             var skeleton = pedData.Ped.Skeleton;
@@ -705,10 +706,28 @@ namespace CodeWalker.Export
                 for (int bi = 0; bi < boneIds.Length; bi++)
                 {
                     var boneId = boneIds[bi];
-                    // Look up the glTF node by bone tag using per-ped mappings.
-                    if (!pedData.BoneTagToNode.TryGetValue(boneId.BoneId, out int nodeIdx)) continue;
 
                     if (boneId.Track == 1) rotationBoneTags.Add(boneId.BoneId);
+
+                    // For facial tracks (24/25/26), remap bone ID through Expression.BoneTracksDict
+                    // if an Expression is provided. This replicates the renderer's behavior in
+                    // Renderable.cs UpdateAnim() where facial bone IDs are remapped before lookup.
+                    ushort effectiveBoneId = boneId.BoneId;
+                    if (expression?.BoneTracksDict != null && (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26))
+                    {
+                        var exprbt = new ExpressionTrack() { BoneId = boneId.BoneId, Track = boneId.Track, Flags = boneId.Unk0 };
+                        if (expression.BoneTracksDict.TryGetValue(exprbt, out var exprbtmap))
+                            effectiveBoneId = exprbtmap.BoneId;
+                    }
+
+                    // For facial tracks, use the remapped bone ID for node lookup
+                    ushort lookupBoneId = (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26) ? effectiveBoneId : boneId.BoneId;
+                    if (!pedData.BoneTagToNode.TryGetValue(lookupBoneId, out int nodeIdx)) continue;
+
+                    // Look up the bone for facial animation calculations (need bind-pose TRS)
+                    Bone bone = null;
+                    if (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26)
+                        pedData.Ped.Skeleton?.BonesMap?.TryGetValue(effectiveBoneId, out bone);
 
                     if (boneId.Track == 0) // Translation
                     {
@@ -785,6 +804,117 @@ namespace CodeWalker.Export
                         int sidx = anim.samplers.Count;
                         anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
                         anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "scale" } });
+                    }
+                    else if (boneId.Track == 24) // Face translation
+                    {
+                        // Renderable.cs: bone.AnimTranslation = bone.Translation + bone.AnimRotation.Multiply(new Vector3(0, v.X * 0.005f, 0))
+                        // The offset is applied in the bone's local rotated space (Y direction in GTA coords).
+                        // Since glTF animation replaces the node transform, we compute the final translation
+                        // as bind-pose translation + rotated offset, then convert to glTF coordinates.
+                        if (bone == null) continue;
+                        var vals = new List<float>();
+                        for (int f = 0; f < frameCount; f++)
+                        {
+                            try
+                            {
+                                float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
+                                var fp = animData.GetFramePosition(t);
+                                var v4 = animData.EvaluateVector4(fp, bi, true);
+                                // The face translation offset is a single float in v4.X,
+                                // applied as a small Y-axis offset in the bone's rotated space.
+                                var fv = new Vector3(0, v4.X * 0.005f, 0);
+                                // Use the bone's bind-pose rotation to rotate the offset
+                                // (in the renderer, AnimRotation may include facial rotation from
+                                // tracks 25/26, but the difference is negligible for this small offset)
+                                var animTrans = bone.Translation + bone.Rotation.Multiply(fv);
+                                // Convert to glTF coordinates
+                                vals.Add(animTrans.X); vals.Add(animTrans.Z); vals.Add(-animTrans.Y);
+                            }
+                            catch
+                            {
+                                // Fallback to bind-pose translation
+                                vals.Add(bone.Translation.X); vals.Add(bone.Translation.Z); vals.Add(-bone.Translation.Y);
+                            }
+                        }
+                        byte[] vb = new byte[vals.Count * 4];
+                        Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                        int valBv = ctx.AddBufferView(vb);
+                        int valAcc = ctx.AddAccessor(valBv, 5126, "VEC3", frameCount);
+                        int sidx = anim.samplers.Count;
+                        anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                        anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "translation" } });
+                    }
+                    else if (boneId.Track == 25) // Face rotation (Euler angles)
+                    {
+                        // Renderable.cs: q = Quaternion.RotationYawPitchRoll(v.Z*mult, v.Y*mult, v.X*mult)
+                        // where mult = -0.314159265f; bone.AnimRotation = bone.Rotation * q
+                        // Since glTF animation replaces the node transform, we output bone.Rotation * q
+                        // (the final animated rotation), converted to glTF coordinates.
+                        if (bone == null) continue;
+                        var vals = new List<float>();
+                        float mult = -0.314159265f;
+                        for (int f = 0; f < frameCount; f++)
+                        {
+                            try
+                            {
+                                float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
+                                var fp = animData.GetFramePosition(t);
+                                var v4 = animData.EvaluateVector4(fp, bi, true);
+                                // Euler angles: roll=v4.X, pitch=v4.Y, yaw=v4.Z
+                                var q = Quaternion.RotationYawPitchRoll(v4.Z * mult, v4.Y * mult, v4.X * mult);
+                                // Final animated rotation = bind-pose rotation * facial delta
+                                var animRot = bone.Rotation * q;
+                                // Convert to glTF coordinates
+                                vals.Add(animRot.X); vals.Add(animRot.Z); vals.Add(-animRot.Y); vals.Add(animRot.W);
+                            }
+                            catch
+                            {
+                                // Fallback to bind-pose rotation
+                                vals.Add(bone.Rotation.X); vals.Add(bone.Rotation.Z); vals.Add(-bone.Rotation.Y); vals.Add(bone.Rotation.W);
+                            }
+                        }
+                        byte[] vb = new byte[vals.Count * 4];
+                        Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                        int valBv = ctx.AddBufferView(vb);
+                        int valAcc = ctx.AddAccessor(valBv, 5126, "VEC4", frameCount);
+                        int sidx = anim.samplers.Count;
+                        anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                        anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "rotation" } });
+                        rotationBoneTags.Add(lookupBoneId);
+                    }
+                    else if (boneId.Track == 26) // Face rotation (Quaternion)
+                    {
+                        // Renderable.cs: bone.AnimRotation = bone.Rotation * q
+                        // Since glTF animation replaces the node transform, we output bone.Rotation * q
+                        // (the final animated rotation), converted to glTF coordinates.
+                        if (bone == null) continue;
+                        var vals = new List<float>();
+                        for (int f = 0; f < frameCount; f++)
+                        {
+                            try
+                            {
+                                float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
+                                var fp = animData.GetFramePosition(t);
+                                var q = animData.EvaluateQuaternion(fp, bi, true);
+                                // Final animated rotation = bind-pose rotation * facial delta
+                                var animRot = bone.Rotation * q;
+                                // Convert to glTF coordinates
+                                vals.Add(animRot.X); vals.Add(animRot.Z); vals.Add(-animRot.Y); vals.Add(animRot.W);
+                            }
+                            catch
+                            {
+                                // Fallback to bind-pose rotation
+                                vals.Add(bone.Rotation.X); vals.Add(bone.Rotation.Z); vals.Add(-bone.Rotation.Y); vals.Add(bone.Rotation.W);
+                            }
+                        }
+                        byte[] vb = new byte[vals.Count * 4];
+                        Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                        int valBv = ctx.AddBufferView(vb);
+                        int valAcc = ctx.AddAccessor(valBv, 5126, "VEC4", frameCount);
+                        int sidx = anim.samplers.Count;
+                        anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                        anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "rotation" } });
+                        rotationBoneTags.Add(lookupBoneId);
                     }
                 }
             }
