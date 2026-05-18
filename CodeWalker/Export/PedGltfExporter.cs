@@ -1230,23 +1230,45 @@ namespace CodeWalker.Export
             if (skeleton == null) return;
 
             var anim = new GltfAnimation { name = cme.Clip.ShortName ?? cme.Clip.Name ?? "Animation" };
-            Animation animData = null;
-            float duration = 0f;
 
+            // Build the list of sub-animations to process.
+            // The GTA V renderer (Renderable.UpdateAnim) iterates over ALL sub-animations
+            // in a ClipAnimationList, applying each one's bone tracks on top of the previous.
+            // Previously this exporter only used the first sub-animation, which missed bone
+            // tracks from other sub-animations. This caused player model distortion because
+            // their clips (e.g. in move_m@generic) use ClipAnimationList with separate
+            // sub-animations for upper body, lower body, etc.
+            var subAnimations = new List<(Animation Animation, float StartTime, float EndTime)>();
             if (cme.Clip is ClipAnimation clipAnim)
             {
-                animData = clipAnim.Animation;
-                duration = clipAnim.EndTime - clipAnim.StartTime;
+                if (clipAnim.Animation != null)
+                    subAnimations.Add((clipAnim.Animation, clipAnim.StartTime, clipAnim.EndTime));
             }
-            else if (cme.Clip is ClipAnimationList clipList && clipList.Animations != null && clipList.Animations.Count > 0)
+            else if (cme.Clip is ClipAnimationList clipList && clipList.Animations != null)
             {
-                animData = clipList.Animations[0].Animation;
-                duration = clipList.Animations[0].EndTime - clipList.Animations[0].StartTime;
+                foreach (var canim in clipList.Animations)
+                {
+                    if (canim?.Animation != null)
+                        subAnimations.Add((canim.Animation, canim.StartTime, canim.EndTime));
+                }
             }
-            if (animData == null || duration <= 0) return;
 
-            if (animData.Duration > 0) duration = animData.Duration;
-            int frameCount = Math.Min(animData.Frames > 0 ? animData.Frames : (int)(duration * 30f), 300);
+            if (subAnimations.Count == 0) return;
+
+            // Use the maximum duration across all sub-animations and the clip's own duration.
+            float duration = 0f;
+            foreach (var sa in subAnimations)
+            {
+                float saDur = sa.EndTime - sa.StartTime;
+                if (saDur > duration) duration = saDur;
+                if (sa.Animation?.Duration > 0 && sa.Animation.Duration > duration)
+                    duration = sa.Animation.Duration;
+            }
+            if (duration <= 0) return;
+
+            // Use the first sub-animation's frame info for frame count calculation.
+            var firstAnim = subAnimations[0].Animation;
+            int frameCount = Math.Min(firstAnim.Frames > 0 ? firstAnim.Frames : (int)(duration * 30f), 300);
             float frameDelta = duration / (frameCount - 1);
 
             // Time accessor
@@ -1257,102 +1279,106 @@ namespace CodeWalker.Export
             int timeBv = ctx.AddBufferView(timeBytes);
             int timeAcc = ctx.AddAccessor(timeBv, 5126, "SCALAR", frameCount, new float[] { 0f }, new float[] { duration });
 
-            var boneIds = animData.BoneIds?.data_items;
-            if (boneIds == null) return;
-
-            // NOTE: Previously, cloth controller bones were skipped from animation export
-            // because they were thought to be driven only by runtime cloth simulation.
-            // However, cloth vertices (bi2==255) in the GLTF export reference cloth bones
-            // via CharClothBoneWeightsInds, and those cloth bones benefit from animation
-            // data. Cloth bones are children of skeletal bones, so they inherit parent
-            // transforms regardless. If the clip provides animation data for cloth bones,
-            // including it gives better local deformation; if not, they stay at bind pose
-            // and still follow the body through the parent-child hierarchy.
-
-            // Track which bone tags have rotation channels, so we can copy
-            // ThighRoll rotations from Thigh bones after the main loop.
+            // Track which bone tags have rotation channels across all sub-animations,
+            // so we can copy ThighRoll rotations from Thigh bones after the main loop.
             var rotationBoneTags = new HashSet<ushort>();
 
-            for (int bi = 0; bi < boneIds.Length; bi++)
+            // Process each sub-animation, just like the renderer does.
+            // Each sub-animation provides bone tracks for a different set of bones,
+            // and they are applied cumulatively (later sub-animations can override
+            // earlier ones for the same bone+track combination).
+            foreach (var subAnim in subAnimations)
             {
-                var boneId = boneIds[bi];
-                // Look up the glTF node by bone tag (BoneId = bone.Tag).
-                // Do NOT use bone.Index since BoneToNode is keyed by array position,
-                // and bone.Index can differ from array position in GTA V ped skeletons.
-                if (!ctx.BoneTagToNode.TryGetValue(boneId.BoneId, out int nodeIdx)) continue;
+                var animData = subAnim.Animation;
+                var boneIds = animData.BoneIds?.data_items;
+                if (boneIds == null) continue;
 
-                if (boneId.Track == 1) rotationBoneTags.Add(boneId.BoneId);
+                for (int bi = 0; bi < boneIds.Length; bi++)
+                {
+                    var boneId = boneIds[bi];
+                    // Look up the glTF node by bone tag (BoneId = bone.Tag).
+                    // Do NOT use bone.Index since BoneToNode is keyed by array position,
+                    // and bone.Index can differ from array position in GTA V ped skeletons.
+                    if (!ctx.BoneTagToNode.TryGetValue(boneId.BoneId, out int nodeIdx)) continue;
 
-                if (boneId.Track == 0) // Translation
-                {
-                    var vals = new List<float>();
-                    for (int f = 0; f < frameCount; f++)
+                    if (boneId.Track == 1) rotationBoneTags.Add(boneId.BoneId);
+
+                    if (boneId.Track == 0) // Translation
                     {
-                        Vector3 val = Vector3.Zero;
-                        try
+                        var vals = new List<float>();
+                        for (int f = 0; f < frameCount; f++)
                         {
-                            var fp = animData.GetFramePosition(f * frameDelta);
-                            var v4 = animData.EvaluateVector4(fp, bi, true);
-                            val = new Vector3(v4.X, v4.Y, v4.Z); // explicit conversion, drop W
+                            Vector3 val = Vector3.Zero;
+                            try
+                            {
+                                // Convert clip time to this sub-animation's local time,
+                                // same as the renderer's canim.GetPlaybackTime(CurrentAnimTime).
+                                float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
+                                var fp = animData.GetFramePosition(t);
+                                var v4 = animData.EvaluateVector4(fp, bi, true);
+                                val = new Vector3(v4.X, v4.Y, v4.Z); // explicit conversion, drop W
+                            }
+                            catch { }
+                            // Y-up LH to Y-up RH: glTF_X = GTA_X, glTF_Y = GTA_Z, glTF_Z = -GTA_Y
+                            vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y);
                         }
-                        catch { }
-                        // Y-up LH to Y-up RH: glTF_X = GTA_X, glTF_Y = GTA_Z, glTF_Z = -GTA_Y
-                        vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y);
+                        byte[] vb = new byte[vals.Count * 4];
+                        Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                        int valBv = ctx.AddBufferView(vb);
+                        int valAcc = ctx.AddAccessor(valBv, 5126, "VEC3", frameCount);
+                        int sidx = anim.samplers.Count;
+                        anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                        anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "translation" } });
                     }
-                    byte[] vb = new byte[vals.Count * 4];
-                    Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
-                    int valBv = ctx.AddBufferView(vb);
-                    int valAcc = ctx.AddAccessor(valBv, 5126, "VEC3", frameCount);
-                    int sidx = anim.samplers.Count;
-                    anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
-                    anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "translation" } });
-                }
-                else if (boneId.Track == 1) // Rotation
-                {
-                    var vals = new List<float>();
-                    for (int f = 0; f < frameCount; f++)
+                    else if (boneId.Track == 1) // Rotation
                     {
-                        Quaternion val = Quaternion.Identity;
-                        try
+                        var vals = new List<float>();
+                        for (int f = 0; f < frameCount; f++)
                         {
-                            var fp = animData.GetFramePosition(f * frameDelta);
-                            val = animData.EvaluateQuaternion(fp, bi, true);
+                            Quaternion val = Quaternion.Identity;
+                            try
+                            {
+                                float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
+                                var fp = animData.GetFramePosition(t);
+                                val = animData.EvaluateQuaternion(fp, bi, true);
+                            }
+                            catch { }
+                            // Y-up LH to Y-up RH quaternion conversion
+                            vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y); vals.Add(val.W);
                         }
-                        catch { }
-                        // Y-up LH to Y-up RH quaternion conversion
-                        vals.Add(val.X); vals.Add(val.Z); vals.Add(-val.Y); vals.Add(val.W);
+                        byte[] vb = new byte[vals.Count * 4];
+                        Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                        int valBv = ctx.AddBufferView(vb);
+                        int valAcc = ctx.AddAccessor(valBv, 5126, "VEC4", frameCount);
+                        int sidx = anim.samplers.Count;
+                        anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                        anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "rotation" } });
                     }
-                    byte[] vb = new byte[vals.Count * 4];
-                    Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
-                    int valBv = ctx.AddBufferView(vb);
-                    int valAcc = ctx.AddAccessor(valBv, 5126, "VEC4", frameCount);
-                    int sidx = anim.samplers.Count;
-                    anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
-                    anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "rotation" } });
-                }
-                else if (boneId.Track == 2) // Scale
-                {
-                    var vals = new List<float>();
-                    for (int f = 0; f < frameCount; f++)
+                    else if (boneId.Track == 2) // Scale
                     {
-                        Vector3 val = Vector3.One;
-                        try
+                        var vals = new List<float>();
+                        for (int f = 0; f < frameCount; f++)
                         {
-                            var fp = animData.GetFramePosition(f * frameDelta);
-                            var v4 = animData.EvaluateVector4(fp, bi, true);
-                            val = new Vector3(v4.X, v4.Y, v4.Z); // explicit conversion, drop W
+                            Vector3 val = Vector3.One;
+                            try
+                            {
+                                float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
+                                var fp = animData.GetFramePosition(t);
+                                var v4 = animData.EvaluateVector4(fp, bi, true);
+                                val = new Vector3(v4.X, v4.Y, v4.Z); // explicit conversion, drop W
+                            }
+                            catch { }
+                            // Scale: axis swap (X,Z,Y) same as bone scale - no negation
+                            vals.Add(val.X); vals.Add(val.Z); vals.Add(val.Y);
                         }
-                        catch { }
-                        // Scale: axis swap (X,Z,Y) same as bone scale - no negation
-                        vals.Add(val.X); vals.Add(val.Z); vals.Add(val.Y);
+                        byte[] vb = new byte[vals.Count * 4];
+                        Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                        int valBv = ctx.AddBufferView(vb);
+                        int valAcc = ctx.AddAccessor(valBv, 5126, "VEC3", frameCount);
+                        int sidx = anim.samplers.Count;
+                        anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                        anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "scale" } });
                     }
-                    byte[] vb = new byte[vals.Count * 4];
-                    Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
-                    int valBv = ctx.AddBufferView(vb);
-                    int valAcc = ctx.AddAccessor(valBv, 5126, "VEC3", frameCount);
-                    int sidx = anim.samplers.Count;
-                    anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
-                    anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = nodeIdx, path = "scale" } });
                 }
             }
 
@@ -1363,10 +1389,23 @@ namespace CodeWalker.Export
             // only contain rotation data for the main Thigh bones, not the ThighRoll bones.
             // Without this, ThighRoll bones stay at bind pose while the thigh animates,
             // causing the leg to "arch" or appear noodly in Blender.
-            CopyThighRollRotation(ctx, anim, animData, boneIds, timeAcc, frameCount, frameDelta, rotationBoneTags);
+            CopyThighRollRotation(ctx, anim, subAnimations, timeAcc, frameCount, frameDelta, rotationBoneTags);
 
             if (anim.channels.Count > 0)
                 ctx.Animations.Add(anim);
+        }
+
+        /// <summary>
+        /// Convert clip time to sub-animation local time, replicating the
+        /// ClipAnimationsEntry.GetPlaybackTime logic from the renderer.
+        /// Maps the global clip time into the sub-animation's [StartTime, EndTime] range.
+        /// </summary>
+        static float GetSubAnimPlaybackTime(float clipTime, float startTime, float endTime)
+        {
+            double duration = endTime - startTime;
+            if (duration <= 0) return clipTime;
+            double curpos = clipTime % duration;
+            return startTime + (float)curpos;
         }
 
         /// <summary>
@@ -1381,8 +1420,9 @@ namespace CodeWalker.Export
         ///   - The ThighRoll bone's parent is NOT already the Thigh bone
         ///     (if it is, it inherits the rotation naturally via the hierarchy)
         /// </summary>
-        static void CopyThighRollRotation(ExportContext ctx, GltfAnimation anim, Animation animData,
-            AnimationBoneId[] boneIds, int timeAcc, int frameCount, float frameDelta,
+        static void CopyThighRollRotation(ExportContext ctx, GltfAnimation anim,
+            List<(Animation Animation, float StartTime, float EndTime)> subAnimations,
+            int timeAcc, int frameCount, float frameDelta,
             HashSet<ushort> rotationBoneTags)
         {
             var bones = ctx.BoneTagToNode; // shorthand
@@ -1415,17 +1455,31 @@ namespace CodeWalker.Export
                 }
                 if (parentIsThigh) continue;
 
-                // Find the bone index in the animation's BoneIds for the Thigh bone
+                // Search across all sub-animations for the Thigh bone rotation track.
+                // The Thigh rotation might be in any of the sub-animations within
+                // a ClipAnimationList.
+                Animation thighAnimData = null;
                 int thighBoneIdx = -1;
-                for (int bi = 0; bi < boneIds.Length; bi++)
+                float thighStartTime = 0f;
+                float thighEndTime = 0f;
+                foreach (var subAnim in subAnimations)
                 {
-                    if (boneIds[bi].BoneId == mapping.thighTag && boneIds[bi].Track == 1)
+                    var boneIds = subAnim.Animation.BoneIds?.data_items;
+                    if (boneIds == null) continue;
+                    for (int bi = 0; bi < boneIds.Length; bi++)
                     {
-                        thighBoneIdx = bi;
-                        break;
+                        if (boneIds[bi].BoneId == mapping.thighTag && boneIds[bi].Track == 1)
+                        {
+                            thighAnimData = subAnim.Animation;
+                            thighBoneIdx = bi;
+                            thighStartTime = subAnim.StartTime;
+                            thighEndTime = subAnim.EndTime;
+                            break;
+                        }
                     }
+                    if (thighBoneIdx >= 0) break;
                 }
-                if (thighBoneIdx < 0) continue;
+                if (thighBoneIdx < 0 || thighAnimData == null) continue;
 
                 // Sample the Thigh rotation at each frame and create a rotation channel for ThighRoll
                 var vals = new List<float>();
@@ -1434,8 +1488,9 @@ namespace CodeWalker.Export
                     Quaternion val = Quaternion.Identity;
                     try
                     {
-                        var fp = animData.GetFramePosition(f * frameDelta);
-                        val = animData.EvaluateQuaternion(fp, thighBoneIdx, true);
+                        float t = GetSubAnimPlaybackTime(f * frameDelta, thighStartTime, thighEndTime);
+                        var fp = thighAnimData.GetFramePosition(t);
+                        val = thighAnimData.EvaluateQuaternion(fp, thighBoneIdx, true);
                     }
                     catch { }
                     // Y-up LH to Y-up RH quaternion conversion
