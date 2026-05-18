@@ -469,6 +469,49 @@ namespace CodeWalker.World
             }
         }
 
+        /// <summary>
+        /// Ensure all scene objects have their animation clips resolved and
+        /// positions/rotations set. This is normally done by Cutscene.Update()
+        /// during playback, but for export we need to do it without playing.
+        /// Without this, AnimClip is null and objects have zero positions,
+        /// causing exports with no animation data.
+        /// </summary>
+        private void EnsureCutsceneLoaded()
+        {
+            if (Cutscene == null) return;
+
+            // Run Update to set AnimClips, positions, and rotations for enabled objects.
+            // This replicates what happens during the first frame of playback.
+            if (Cutscene.PlaybackTime <= 0.0f && Cutscene.Duration > 0.0f)
+            {
+                Cutscene.Update(0.0f);
+            }
+
+            // For any scene objects that still don't have AnimClips (e.g., objects that
+            // appear later in the timeline and haven't been enabled yet), resolve them
+            // manually by looking up their AnimHash in the YCD CutsceneMap.
+            if (Cutscene.Ycds != null && Cutscene.SceneObjects != null)
+            {
+                foreach (var ycd in Cutscene.Ycds)
+                {
+                    if (ycd?.CutsceneMap == null) continue;
+                    foreach (var obj in Cutscene.SceneObjects.Values)
+                    {
+                        if (obj.AnimClip != null || obj.AnimHash == 0) continue;
+
+                        ClipMapEntry cme = null;
+                        ycd.CutsceneMap.TryGetValue(obj.AnimHash, out cme);
+                        obj.AnimClip = cme;
+
+                        if (obj.Ped != null && cme != null)
+                        {
+                            obj.Ped.AnimClip = cme;
+                        }
+                    }
+                }
+            }
+        }
+
         private void ExportGltfButton_Click(object sender, EventArgs e)
         {
             if (Cutscene == null)
@@ -477,6 +520,13 @@ namespace CodeWalker.World
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+
+            // Ensure cutscene animation data is loaded before export.
+            // Normally, animation clips and object positions are resolved during
+            // Cutscene.Update() which is called when the user clicks Play.
+            // Without this step, AnimClip is null and positions are zero,
+            // resulting in exported models with no animation or wrong positions.
+            EnsureCutsceneLoaded();
 
             if (Cutscene.SceneObjects == null || Cutscene.SceneObjects.Count == 0)
             {
