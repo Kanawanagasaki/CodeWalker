@@ -439,6 +439,21 @@ namespace CodeWalker.Export
                     boneToArrayIndex[bones[i]] = i;
             }
 
+            // Pre-build bone Tag→array-position lookup for the ped's main skeleton.
+            // This is needed because geom.BoneIds[] references the component drawable's
+            // own skeleton, which may have bones at different array positions than the
+            // ped's main skeleton (especially for player models like player_zero/one/two).
+            // We need to convert from component skeleton indices to ped skeleton indices
+            // so that JOINTS_0 values correctly reference the glTF armature built from
+            // the ped's skeleton.
+            Dictionary<ushort, int> pedTagToArrayIndex = null;
+            if (bones != null)
+            {
+                pedTagToArrayIndex = new Dictionary<ushort, int>(bones.Length);
+                for (int i = 0; i < bones.Length; i++)
+                    pedTagToArrayIndex[bones[i].Tag] = i;
+            }
+
             for (int compIdx = 0; compIdx < 12; compIdx++)
             {
                 var drawable = ped.Drawables[compIdx];
@@ -490,6 +505,38 @@ namespace CodeWalker.Export
                     }
                 }
 
+                // Build component skeleton → ped skeleton bone index mapping.
+                // geom.BoneIds[] values are indices into the component drawable's skeleton,
+                // but the glTF armature (skin joints, IBMs) is built from the ped's main
+                // skeleton. For most NPC peds, both skeletons have identical bone ordering,
+                // so BoneIds values work directly. But for player models (player_zero,
+                // player_one, player_two), the component drawable's skeleton and the ped's
+                // .yft skeleton have bones at different array positions. Without this mapping,
+                // JOINTS_0 values reference wrong bones, causing distorted animation:
+                // moving hand bones stretches face geometry, moving leg bones stretches
+                // random body parts, etc.
+                //
+                // The renderer handles this via a "skeleton transplant" (Renderer.cs line 3532+),
+                // which copies animated bone data from the ped's skeleton into the component's
+                // skeleton at the correct positions using Tag matching. We replicate that
+                // Tag-based matching here to build the index mapping.
+                Dictionary<int, int> compBoneToPedBone = null;
+                var compSkeleton = drawable.Skeleton;
+                if (compSkeleton != null && compSkeleton != skeleton &&
+                    compSkeleton.Bones?.Items != null && pedTagToArrayIndex != null)
+                {
+                    var compBones = compSkeleton.Bones.Items;
+                    compBoneToPedBone = new Dictionary<int, int>(compBones.Length);
+                    for (int ci = 0; ci < compBones.Length; ci++)
+                    {
+                        ushort tag = compBones[ci].Tag;
+                        if (pedTagToArrayIndex.TryGetValue(tag, out int pedIdx))
+                            compBoneToPedBone[ci] = pedIdx;
+                        else
+                            compBoneToPedBone[ci] = 0; // fallback to root bone
+                    }
+                }
+
                 var diffuseTex = FindDiffuseTexture(drawable, texture);
                 int? materialIdx = null;
                 if (diffuseTex != null)
@@ -520,7 +567,7 @@ namespace CodeWalker.Export
                         // rendered directly. The renderer skips them via disableRendering flag.
                         if (ShouldSkipGeometry(geom)) continue;
 
-                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothVertexData);
+                        var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothVertexData, compBoneToPedBone);
                         if (prim != null)
                         {
                             if (materialIdx.HasValue) prim.material = materialIdx.Value;
@@ -550,7 +597,7 @@ namespace CodeWalker.Export
             }
         }
 
-        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton, ClothVertexData clothVertexData = null)
+        static GltfMeshPrimitive BuildPrimitive(ExportContext ctx, DrawableGeometry geom, DrawableModel model, Skeleton skeleton, ClothVertexData clothVertexData = null, Dictionary<int, int> compBoneToPedBone = null)
         {
             // Use geom.VertexData which resolves Data1 ?? Data2 automatically
             var vdata = geom.VertexData;
@@ -758,11 +805,11 @@ namespace CodeWalker.Export
                         else { bw.X = 1f; bw.Y = 0f; bw.Z = 0f; bw.W = 0f; }
                         blendWeights.Add(bw.X); blendWeights.Add(bw.Y); blendWeights.Add(bw.Z); blendWeights.Add(bw.W);
 
-                        // Remap local bone indices to global skeleton bone indices
-                        blendJoints.Add(RemapBoneIndex(bi0, geomBoneIds, skeleton));
-                        blendJoints.Add(RemapBoneIndex(bi1, geomBoneIds, skeleton));
-                        blendJoints.Add(RemapBoneIndex(bi2, geomBoneIds, skeleton));
-                        blendJoints.Add(RemapBoneIndex(bi3, geomBoneIds, skeleton));
+                        // Remap local bone indices → component skeleton indices → ped skeleton indices
+                        blendJoints.Add(RemapBoneIndex(bi0, geomBoneIds, skeleton, compBoneToPedBone));
+                        blendJoints.Add(RemapBoneIndex(bi1, geomBoneIds, skeleton, compBoneToPedBone));
+                        blendJoints.Add(RemapBoneIndex(bi2, geomBoneIds, skeleton, compBoneToPedBone));
+                        blendJoints.Add(RemapBoneIndex(bi3, geomBoneIds, skeleton, compBoneToPedBone));
                     }
                 }
             }
@@ -829,14 +876,33 @@ namespace CodeWalker.Export
             return prim;
         }
 
-        static ushort RemapBoneIndex(byte localIdx, ushort[] geomBoneIds, Skeleton skeleton)
+        static ushort RemapBoneIndex(byte localIdx, ushort[] geomBoneIds, Skeleton skeleton, Dictionary<int, int> compBoneToPedBone = null)
         {
-            // geom.BoneIds[] maps vertex local bone indices to skeleton bone array indices.
-            // The values ARE direct skeleton bone indices (not bone tags/hashes).
-            // This is confirmed by Renderable.UpdateBoneTransforms which does:
+            // geom.BoneIds[] maps vertex local bone indices to the component drawable's
+            // skeleton bone array indices (NOT the ped's main skeleton indices).
+            // The renderer confirms this: Renderable.UpdateBoneTransforms does
             //   var id = boneids[b]; geom.BoneTransforms[b] = bonetransforms[id];
+            // where bonetransforms[] is indexed by the component's skeleton array.
+            //
+            // For NPC peds, the component drawable's skeleton typically has identical
+            // bone ordering to the ped's .yft skeleton, so BoneIds values work directly.
+            //
+            // For player models (player_zero, player_one, player_two), the component
+            // drawable's skeleton and the ped's .yft skeleton have bones at different
+            // array positions. We must convert from component skeleton indices to
+            // ped skeleton indices using the compBoneToPedBone mapping (built via
+            // bone Tag matching, same as the renderer's "skeleton transplant").
             if (geomBoneIds == null || localIdx >= geomBoneIds.Length) return 0;
-            return geomBoneIds[localIdx];
+            int compIdx = geomBoneIds[localIdx];
+
+            // If we have a component→ped mapping, use it to convert the index
+            if (compBoneToPedBone != null && compBoneToPedBone.TryGetValue(compIdx, out int pedIdx))
+                return (ushort)pedIdx;
+
+            // No mapping available — the component and ped skeletons share the same
+            // bone ordering (or the component has no skeleton of its own), so the
+            // BoneIds value can be used directly as a ped skeleton array index.
+            return (ushort)compIdx;
         }
 
         /// <summary>
