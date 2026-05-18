@@ -3,6 +3,7 @@ using CodeWalker.World;
 using SharpDX;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace CodeWalker.Export
 {
@@ -80,7 +81,17 @@ namespace CodeWalker.Export
                 if (animClip != null)
                 {
                     string animName = pedData.Armature.Ped.Name ?? ("Ped_" + pedData.CutsceneObject.ObjectID);
-                    GltfWriter.BuildPedAnimation(ctx, pedData.Armature, animClip, animName, pedData.Armature.Ped.Expression);
+
+                    // Build a merged BoneTracksDict from all per-component expressions.
+                    // The renderer uses ped.Expressions[i] (per-component) for facial bone remapping,
+                    // but BuildPedAnimation only accepts a single BoneTracksDict. Merging all component
+                    // expressions ensures every facial bone ID can be remapped, regardless of which
+                    // component's expression it came from. This fixes facial animations (mouth, eyebrows,
+                    // etc.) being silently skipped in the export when ped.Expression is null or incomplete.
+                    var mergedBoneTracksDict = BuildMergedBoneTracksDict(pedData.Armature.Ped);
+
+                    GltfWriter.BuildPedAnimation(ctx, pedData.Armature, animClip, animName,
+                        pedData.Armature.Ped.Expression, mergedBoneTracksDict);
                 }
             }
 
@@ -151,6 +162,63 @@ namespace CodeWalker.Export
             ctx.RootNodeIndex = ctx.Nodes.Count;
             ctx.Nodes.Add(rootNode);
             ctx.NodeChildren[ctx.RootNodeIndex] = new List<int>();
+        }
+
+        #endregion
+
+        #region Facial Expression Resolution
+
+        /// <summary>
+        /// Build a merged BoneTracksDict from all per-component expressions of a ped.
+        ///
+        /// In the GTA V renderer, each ped component (Head, Berd, Hair, etc.) has its own
+        /// Expression loaded from the ped's YED file, keyed by the drawable's name hash.
+        /// The renderer uses ped.Expressions[i] (per-component) for facial bone remapping
+        /// in Renderable.UpdateAnim(). However, the cutscene animation clip contains ALL
+        /// facial bone tracks for the entire ped in a single clip — not separated by component.
+        ///
+        /// ped.Expression (the global expression from InitData.ExpressionName) may be null
+        /// or may have an incomplete BoneTracksDict compared to the union of all component
+        /// expressions. When the BoneTracksDict is null or missing entries, facial bone IDs
+        /// in tracks 24/25/26 cannot be remapped to skeleton bone tags, causing those tracks
+        /// to be silently skipped in the export — resulting in no facial animation.
+        ///
+        /// This method merges all BoneTracksDict entries from ped.Expressions[0..11] into a
+        /// single dictionary, ensuring complete facial bone remapping coverage. It also
+        /// includes entries from ped.Expression as a fallback.
+        /// </summary>
+        static Dictionary<ExpressionTrack, ExpressionTrack> BuildMergedBoneTracksDict(Ped ped)
+        {
+            var merged = new Dictionary<ExpressionTrack, ExpressionTrack>();
+
+            // First, add entries from the global expression (lowest priority)
+            if (ped.Expression?.BoneTracksDict != null)
+            {
+                foreach (var kvp in ped.Expression.BoneTracksDict)
+                {
+                    if (!merged.ContainsKey(kvp.Key))
+                        merged[kvp.Key] = kvp.Value;
+                }
+            }
+
+            // Then, add entries from per-component expressions (higher priority, may override)
+            // The renderer uses ped.Expressions[i] per component, so these are the authoritative
+            // source for facial bone remapping.
+            if (ped.Expressions != null)
+            {
+                foreach (var expr in ped.Expressions)
+                {
+                    if (expr?.BoneTracksDict == null) continue;
+                    foreach (var kvp in expr.BoneTracksDict)
+                    {
+                        // Later components override earlier ones for the same key.
+                        // This matches the renderer's sequential application of expressions.
+                        merged[kvp.Key] = kvp.Value;
+                    }
+                }
+            }
+
+            return merged.Count > 0 ? merged : null;
         }
 
         #endregion

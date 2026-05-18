@@ -633,7 +633,11 @@ namespace CodeWalker.Export
         /// <param name="animClip">The animation clip to export</param>
         /// <param name="animName">Name for the animation</param>
         /// <param name="expression">Optional Expression for facial bone remapping (tracks 24/25/26). Can be null.</param>
-        public static void BuildPedAnimation(ExportContext ctx, PedArmatureData pedData, ClipMapEntry animClip, string animName, Expression expression = null)
+        /// <param name="boneTracksDictOverride">Optional merged BoneTracksDict for facial bone remapping.
+        /// When provided, takes precedence over expression?.BoneTracksDict. Used by the cutscene exporter
+        /// which merges per-component expressions to ensure all facial bones are remapped correctly,
+        /// matching the renderer's behavior of using ped.Expressions[i] per component.</param>
+        public static void BuildPedAnimation(ExportContext ctx, PedArmatureData pedData, ClipMapEntry animClip, string animName, Expression expression = null, Dictionary<ExpressionTrack, ExpressionTrack> boneTracksDictOverride = null)
         {
             if (animClip?.Clip == null) return;
             var skeleton = pedData.Ped.Skeleton;
@@ -708,15 +712,23 @@ namespace CodeWalker.Export
                 {
                     var boneId = boneIds[bi];
 
-                    // For facial tracks (24/25/26), remap bone ID through Expression.BoneTracksDict
-                    // if an Expression is provided. This replicates the renderer's behavior in
-                    // Renderable.cs UpdateAnim() where facial bone IDs are remapped before lookup.
+                    // For facial tracks (24/25/26), remap bone ID through the BoneTracksDict.
+                    // This replicates the renderer's behavior in Renderable.cs UpdateAnim()
+                    // where facial bone IDs are remapped before lookup.
+                    // The boneTracksDictOverride (merged from per-component expressions) takes
+                    // precedence over expression?.BoneTracksDict, ensuring all facial bones from
+                    // all components are correctly remapped — matching the renderer which uses
+                    // ped.Expressions[i] per component.
                     ushort effectiveBoneId = boneId.BoneId;
-                    if (expression?.BoneTracksDict != null && (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26))
+                    if (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26)
                     {
-                        var exprbt = new ExpressionTrack() { BoneId = boneId.BoneId, Track = boneId.Track, Flags = boneId.Unk0 };
-                        if (expression.BoneTracksDict.TryGetValue(exprbt, out var exprbtmap))
-                            effectiveBoneId = exprbtmap.BoneId;
+                        var btDict = boneTracksDictOverride ?? expression?.BoneTracksDict;
+                        if (btDict != null)
+                        {
+                            var exprbt = new ExpressionTrack() { BoneId = boneId.BoneId, Track = boneId.Track, Flags = boneId.Unk0 };
+                            if (btDict.TryGetValue(exprbt, out var exprbtmap))
+                                effectiveBoneId = exprbtmap.BoneId;
+                        }
                     }
 
                     // For facial tracks, use the remapped bone ID for node lookup
