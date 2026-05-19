@@ -1196,7 +1196,7 @@ namespace CodeWalker.World
             }
             json["variables"] = varsArr;
             json["signature"] = expr.Signature;
-            json["unknown7C"] = expr.Unknown_7C;
+            json["unknown7Ch"] = expr.Unknown_7Ch;
         }
 
         /// <summary>
