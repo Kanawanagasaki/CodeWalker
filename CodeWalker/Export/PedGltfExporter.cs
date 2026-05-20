@@ -23,5 +23,22 @@ namespace CodeWalker.Export
             if (isGlb) GltfWriter.WriteGlb(ctx, filePath);
             else GltfWriter.WriteGltf(ctx, filePath);
         }
+
+        /// <summary>
+        /// Exports a Ped with mesh, textures, and armature only — no animation.
+        /// Intended for batch export where animations are not needed.
+        /// </summary>
+        public static void ExportWithoutAnimation(Ped ped, string filePath)
+        {
+            bool isGlb = filePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase);
+            var ctx = new GltfWriter.ExportContext();
+
+            var pedData = GltfWriter.BuildPedArmature(ctx, ped, ped.Name ?? "Ped", null, null, null, -1);
+            GltfWriter.BuildPedMeshes(ctx, ped, pedData, "");
+            // Intentionally skip animation — batch export is geometry + textures + skeleton only
+
+            if (isGlb) GltfWriter.WriteGlb(ctx, filePath);
+            else GltfWriter.WriteGltf(ctx, filePath);
+        }
     }
 }

@@ -77,6 +77,7 @@
             this.StatsUpdateTimer = new System.Windows.Forms.Timer(this.components);
             this.ToolsPedTabPage = new System.Windows.Forms.TabPage();
             this.ExportGltfButton = new System.Windows.Forms.Button();
+            this.BatchExportGltfButton = new System.Windows.Forms.Button();
             this.EnableRootMotionCheckBox = new System.Windows.Forms.CheckBox();
             this.label23 = new System.Windows.Forms.Label();
             this.label22 = new System.Windows.Forms.Label();
@@ -658,6 +659,7 @@
             // 
             // ToolsPedTabPage
             // 
+            this.ToolsPedTabPage.Controls.Add(this.BatchExportGltfButton);
             this.ToolsPedTabPage.Controls.Add(this.ExportGltfButton);
             this.ToolsPedTabPage.Controls.Add(this.EnableRootMotionCheckBox);
             this.ToolsPedTabPage.Controls.Add(this.label23);
@@ -708,6 +710,16 @@
             this.ExportGltfButton.Text = "Export as glTF/GLB...";
             this.ExportGltfButton.UseVisualStyleBackColor = true;
             this.ExportGltfButton.Click += new System.EventHandler(this.ExportGltfButton_Click);
+            //
+            // BatchExportGltfButton
+            //
+            this.BatchExportGltfButton.Location = new System.Drawing.Point(3, 560);
+            this.BatchExportGltfButton.Name = "BatchExportGltfButton";
+            this.BatchExportGltfButton.Size = new System.Drawing.Size(233, 28);
+            this.BatchExportGltfButton.TabIndex = 34;
+            this.BatchExportGltfButton.Text = "Batch Export glTF...";
+            this.BatchExportGltfButton.UseVisualStyleBackColor = true;
+            this.BatchExportGltfButton.Click += new System.EventHandler(this.BatchExportGltfButton_Click);
             //
             // EnableRootMotionCheckBox
             // 
@@ -1209,6 +1221,7 @@
         private System.Windows.Forms.ComboBox ClipDictComboBox;
         private System.Windows.Forms.Label label23;
         private System.Windows.Forms.Button ExportGltfButton;
+        private System.Windows.Forms.Button BatchExportGltfButton;
         private System.Windows.Forms.CheckBox EnableRootMotionCheckBox;
     }
 }

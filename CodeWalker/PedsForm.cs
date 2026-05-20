@@ -1662,5 +1662,91 @@ namespace CodeWalker
                 }
             }
         }
+
+        private void BatchExportGltfButton_Click(object sender, EventArgs e)
+        {
+            if (GameFileCache.PedsInitDict == null || GameFileCache.PedsInitDict.Count == 0)
+            {
+                MessageBox.Show("No peds available. Please wait for the game files to finish loading.",
+                    "Batch Export", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            using (var selDlg = new BatchPedExportForm(GameFileCache))
+            {
+                if (selDlg.ShowDialog(this) != DialogResult.OK) return;
+
+                var selectedPeds = selDlg.GetSelectedPeds()?.ToList();
+                if (selectedPeds == null || selectedPeds.Count == 0)
+                {
+                    MessageBox.Show("No peds selected for export.", "Batch Export",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // Choose output folder
+                using (var fbd = new FolderBrowserDialog())
+                {
+                    fbd.Description = "Select output folder for batch glTF export";
+                    fbd.ShowNewFolderButton = true;
+
+                    if (fbd.ShowDialog(this) != DialogResult.OK) return;
+
+                    var outputFolder = fbd.SelectedPath;
+                    var successCount = 0;
+                    var failCount = 0;
+                    var errors = new List<string>();
+
+                    for (int i = 0; i < selectedPeds.Count; i++)
+                    {
+                        var pedInit = selectedPeds[i];
+                        var pedName = pedInit.Name;
+                        var filePath = System.IO.Path.Combine(outputFolder, pedName + ".glb");
+
+                        UpdateStatus($"Exporting {i + 1}/{selectedPeds.Count}: {pedName}...");
+
+                        try
+                        {
+                            // Create a temporary Ped object, init with default components, export without animation
+                            var ped = new Ped();
+                            ped.Init(pedName, GameFileCache);
+                            ped.LoadDefaultComponents(GameFileCache);
+
+                            if (ped.Yft == null)
+                            {
+                                errors.Add($"{pedName}: No skeleton YFT loaded (skipped)");
+                                failCount++;
+                                continue;
+                            }
+
+                            PedGltfExporter.ExportWithoutAnimation(ped, filePath);
+                            successCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            errors.Add($"{pedName}: {ex.Message}");
+                            failCount++;
+                        }
+                    }
+
+                    UpdateStatus("Batch export complete.");
+
+                    var msg = $"Batch export complete!\n\n" +
+                              $"Successful: {successCount}\n" +
+                              $"Failed: {failCount}\n" +
+                              $"Output folder: {outputFolder}";
+
+                    if (errors.Count > 0)
+                    {
+                        msg += "\n\nErrors:\n" + string.Join("\n", errors.Take(20));
+                        if (errors.Count > 20)
+                            msg += $"\n...and {errors.Count - 20} more";
+                    }
+
+                    MessageBox.Show(msg, "Batch Export Complete", MessageBoxButtons.OK,
+                        failCount > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                }
+            }
+        }
     }
 }
