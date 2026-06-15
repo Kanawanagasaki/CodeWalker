@@ -538,7 +538,7 @@ namespace CodeWalker.World
             }
 
             // Show the object selection dialog
-            using (var selDlg = new CutsceneExportSelectionDialog(Cutscene))
+            using (var selDlg = new CutsceneExportSelectionDialog(Cutscene, GameFileCache))
             {
                 if (selDlg.ShowDialog(this) != DialogResult.OK) return;
 
@@ -548,6 +548,17 @@ namespace CodeWalker.World
                     MessageBox.Show("No objects selected for export.", "Export Error",
                         MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
+                }
+
+                // Apply ped model override if one was selected in the dialog.
+                // This swaps the ped's visual model (drawables + textures) while
+                // keeping the original skeleton and animation from the cutscene.
+                var overrideName = selDlg.PedModelOverride;
+                var overrideTarget = selDlg.OverrideTargetPed;
+                if (!string.IsNullOrEmpty(overrideName) && overrideTarget?.Ped != null
+                    && overrideName != "(Original — no override)")
+                {
+                    ApplyPedModelOverride(overrideTarget, overrideName);
                 }
 
                 using (var sfd = new SaveFileDialog())
@@ -579,6 +590,102 @@ namespace CodeWalker.World
             }
         }
 
+        /// <summary>
+        /// Swap a cutscene ped's visual model (mesh + textures) with a different ped model,
+        /// while preserving the original skeleton and animation. This allows exporting
+        /// a cutscene character with a different appearance — for example, applying
+        /// Michael's cutscene animation to a custom ped model.
+        ///
+        /// The override loads the new ped's drawables, textures, and per-component
+        /// expressions from GameFileCache, then copies them into the cutscene ped's
+        /// component slots. The original skeleton, AnimClip, and global Expression
+        /// are preserved so the animation plays correctly on the new model.
+        /// </summary>
+        private void ApplyPedModelOverride(CutsceneObject csObj, string overridePedName)
+        {
+            if (csObj?.Ped == null || string.IsNullOrEmpty(overridePedName)) return;
+
+            try
+            {
+                // Load the override ped model
+                var overridePed = new Ped();
+                overridePed.Init(overridePedName, GameFileCache);
+                overridePed.LoadDefaultComponents(GameFileCache);
+
+                var ped = csObj.Ped;
+
+                // Preserve the cutscene skeleton and animation
+                var origSkeleton = ped.Skeleton;
+                var origAnimClip = ped.AnimClip;
+                var origExpression = ped.Expression;
+                var origName = ped.Name;
+                var origNameHash = ped.NameHash;
+
+                // Copy the override ped's visual model into the cutscene ped.
+                // This replaces drawables (geometry), textures, per-component expressions,
+                // and supporting data (Ydd, Ytd, variation dicts, etc.).
+                ped.Name = overridePed.Name;
+                ped.NameHash = overridePed.NameHash;
+                ped.InitData = overridePed.InitData;
+                ped.Ydd = overridePed.Ydd;
+                ped.Ytd = overridePed.Ytd;
+                ped.Ymt = overridePed.Ymt;
+                ped.DrawableFilesDict = overridePed.DrawableFilesDict;
+                ped.DrawableFiles = overridePed.DrawableFiles;
+                ped.TextureFilesDict = overridePed.TextureFilesDict;
+                ped.TextureFiles = overridePed.TextureFiles;
+                ped.ClothFilesDict = overridePed.ClothFilesDict;
+                ped.ClothFiles = overridePed.ClothFiles;
+
+                for (int i = 0; i < 12; i++)
+                {
+                    ped.Drawables[i] = overridePed.Drawables[i];
+                    ped.Textures[i] = overridePed.Textures[i];
+                    ped.DrawableNames[i] = overridePed.DrawableNames[i];
+                    ped.Clothes[i] = overridePed.Clothes[i];
+                    // Copy per-component expressions from the override ped.
+                    // These are used by the Expression VM for facial bone remapping
+                    // during animation export — the BoneTracksDict maps animation
+                    // facial bone IDs to skeleton bone IDs, and different ped models
+                    // may have different mappings.
+                    ped.Expressions[i] = overridePed.Expressions[i];
+                }
+
+                // Restore the cutscene skeleton and animation
+                ped.Skeleton = origSkeleton;
+                ped.AnimClip = origAnimClip;
+                ped.Expression = origExpression;
+
+                // Override ped's Yft and skeleton are NOT applied — the cutscene skeleton
+                // must be preserved because the animation clip targets its bone hierarchy.
+                // However, we keep the override ped's Yed (expression dictionary) since
+                // per-component expressions need to be resolved from the correct YED.
+                ped.Yed = overridePed.Yed;
+                ped.Yld = overridePed.Yld;
+
+                // Re-resolve the global Expression from the override ped's YED using
+                // the original cutscene expression name. This is needed because the
+                // override ped may have a different expression dictionary, and the
+                // per-component expressions come from the override model's YED.
+                // The global expression provides the VM's bytecode streams and
+                // BoneTracksDict, which must match the override model's face.
+                if (overridePed.InitData != null && !string.IsNullOrEmpty(overridePed.InitData.ExpressionName))
+                {
+                    var exprhash = JenkHash.GenHash(overridePed.InitData.ExpressionName.ToLowerInvariant());
+                    Expression expr = null;
+                    overridePed.Yed?.ExprMap?.TryGetValue(exprhash, out expr);
+                    if (expr != null)
+                        ped.Expression = expr;
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Failed to load override ped model '{overridePedName}':\n\n{ex.Message}",
+                    "Model Override Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
         private void ExportDebugDataButton_Click(object sender, EventArgs e)
         {
             if (Cutscene == null)
@@ -598,7 +705,7 @@ namespace CodeWalker.World
             }
 
             // Show the object selection dialog (reuse the same one as glTF export)
-            using (var selDlg = new CutsceneExportSelectionDialog(Cutscene))
+            using (var selDlg = new CutsceneExportSelectionDialog(Cutscene, GameFileCache))
             {
                 if (selDlg.ShowDialog(this) != DialogResult.OK) return;
 

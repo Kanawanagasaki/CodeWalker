@@ -8,7 +8,9 @@ namespace CodeWalker.World
 {
     /// <summary>
     /// Dialog for selecting which cutscene objects (characters, props, weapons, vehicles)
-    /// to export as glTF/GLB.
+    /// to export as glTF/GLB. When exactly one ped is selected, a model override dropdown
+    /// appears allowing the user to swap the ped's visual model (mesh + textures) while
+    /// keeping the original skeleton and animation from the cutscene.
     /// </summary>
     public class CutsceneExportSelectionDialog : Form
     {
@@ -20,21 +22,40 @@ namespace CodeWalker.World
         private Button CancelBtn;
         private Label LabelInfo;
 
+        // Ped model override controls
+        private Label PedOverrideLabel;
+        private ComboBox PedOverrideComboBox;
+
         private readonly Cutscene _cutscene;
+        private readonly GameFileCache _gfc;
         private readonly List<CutsceneObject> _objects = new List<CutsceneObject>();
 
-        public CutsceneExportSelectionDialog(Cutscene cutscene)
+        /// <summary>
+        /// The ped model name selected for override, or null/empty if no override.
+        /// </summary>
+        public string PedModelOverride => PedOverrideComboBox?.SelectedItem as string;
+
+        /// <summary>
+        /// The single ped CutsceneObject that will have its model overridden,
+        /// or null if zero or multiple peds are selected.
+        /// </summary>
+        public CutsceneObject OverrideTargetPed { get; private set; }
+
+        public CutsceneExportSelectionDialog(Cutscene cutscene, GameFileCache gfc)
         {
             _cutscene = cutscene;
+            _gfc = gfc;
             InitializeComponent();
             PopulateObjects();
+            PopulatePedOverrideList();
+            UpdatePedOverrideVisibility();
         }
 
         private void InitializeComponent()
         {
             this.Text = "Select Objects to Export";
-            this.Size = new System.Drawing.Size(480, 520);
-            this.MinimumSize = new System.Drawing.Size(400, 400);
+            this.Size = new System.Drawing.Size(480, 580);
+            this.MinimumSize = new System.Drawing.Size(400, 480);
             this.FormBorderStyle = FormBorderStyle.Sizable;
             this.StartPosition = FormStartPosition.CenterParent;
             this.MaximizeBox = false;
@@ -56,11 +77,34 @@ namespace CodeWalker.World
             this.ObjectsCheckedListBox = new CheckedListBox
             {
                 Location = new System.Drawing.Point(12, 62),
-                Size = new System.Drawing.Size(440, 310),
+                Size = new System.Drawing.Size(440, 280),
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 CheckOnClick = true,
             };
+            this.ObjectsCheckedListBox.ItemCheck += ObjectsCheckedListBox_ItemCheck;
             this.Controls.Add(this.ObjectsCheckedListBox);
+
+            // Ped model override label
+            this.PedOverrideLabel = new Label
+            {
+                Text = "Override ped model:",
+                Location = new System.Drawing.Point(12, 352),
+                Size = new System.Drawing.Size(120, 20),
+                Visible = false,
+            };
+            this.Controls.Add(this.PedOverrideLabel);
+
+            // Ped model override combobox
+            this.PedOverrideComboBox = new ComboBox
+            {
+                Location = new System.Drawing.Point(138, 350),
+                Size = new System.Drawing.Size(314, 22),
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Sorted = false, // already sorted during population
+                Visible = false,
+            };
+            this.Controls.Add(this.PedOverrideComboBox);
 
             // Select All button
             this.SelectAllButton = new Button
@@ -74,6 +118,7 @@ namespace CodeWalker.World
             {
                 for (int i = 0; i < ObjectsCheckedListBox.Items.Count; i++)
                     ObjectsCheckedListBox.SetItemChecked(i, true);
+                UpdatePedOverrideVisibility();
             };
             this.Controls.Add(this.SelectAllButton);
 
@@ -89,6 +134,7 @@ namespace CodeWalker.World
             {
                 for (int i = 0; i < ObjectsCheckedListBox.Items.Count; i++)
                     ObjectsCheckedListBox.SetItemChecked(i, false);
+                UpdatePedOverrideVisibility();
             };
             this.Controls.Add(this.DeselectAllButton);
 
@@ -107,6 +153,7 @@ namespace CodeWalker.World
                     var obj = _objects[i];
                     ObjectsCheckedListBox.SetItemChecked(i, obj.Ped != null);
                 }
+                UpdatePedOverrideVisibility();
             };
             this.Controls.Add(this.SelectPedsButton);
 
@@ -190,6 +237,73 @@ namespace CodeWalker.World
             }
 
             ObjectsCheckedListBox.EndUpdate();
+        }
+
+        /// <summary>
+        /// Populate the ped model override ComboBox with all available ped models
+        /// from GameFileCache.PedsInitDict, sorted alphabetically.
+        /// The first item is always "(Original — no override)".
+        /// </summary>
+        private void PopulatePedOverrideList()
+        {
+            if (PedOverrideComboBox == null) return;
+
+            PedOverrideComboBox.BeginUpdate();
+            PedOverrideComboBox.Items.Clear();
+
+            // Default option: no override
+            PedOverrideComboBox.Items.Add("(Original — no override)");
+
+            // Add all ped models from the game file cache
+            if (_gfc?.PedsInitDict != null)
+            {
+                var peds = _gfc.PedsInitDict.Values
+                    .Where(p => !string.IsNullOrEmpty(p.Name))
+                    .OrderBy(p => p.Name)
+                    .ToList();
+
+                foreach (var ped in peds)
+                {
+                    PedOverrideComboBox.Items.Add(ped.Name);
+                }
+            }
+
+            // Select the default (no override)
+            PedOverrideComboBox.SelectedIndex = 0;
+            PedOverrideComboBox.EndUpdate();
+        }
+
+        /// <summary>
+        /// Show/hide the ped model override dropdown based on how many peds are checked.
+        /// The dropdown is only visible when exactly one ped is selected.
+        /// </summary>
+        private void UpdatePedOverrideVisibility()
+        {
+            // Find all checked peds
+            var checkedPeds = new List<CutsceneObject>();
+            for (int i = 0; i < ObjectsCheckedListBox.Items.Count; i++)
+            {
+                if (ObjectsCheckedListBox.GetItemChecked(i) && i < _objects.Count)
+                {
+                    if (_objects[i].Ped != null)
+                        checkedPeds.Add(_objects[i]);
+                }
+            }
+
+            bool showOverride = checkedPeds.Count == 1;
+            PedOverrideLabel.Visible = showOverride;
+            PedOverrideComboBox.Visible = showOverride;
+            OverrideTargetPed = showOverride ? checkedPeds[0] : null;
+
+            // Reset to "no override" when hiding
+            if (!showOverride && PedOverrideComboBox.Items.Count > 0)
+                PedOverrideComboBox.SelectedIndex = 0;
+        }
+
+        private void ObjectsCheckedListBox_ItemCheck(object sender, ItemCheckEventArgs e)
+        {
+            // Use BeginInvoke to defer the visibility update until after the check state changes
+            BeginInvoke((Action)(() => UpdatePedOverrideVisibility()));
         }
 
         /// <summary>
