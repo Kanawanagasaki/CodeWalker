@@ -10,6 +10,7 @@ using Buffer = SharpDX.Direct3D11.Buffer;
 using CodeWalker.World;
 using SharpDX.Direct3D;
 using SharpDX;
+using System.Diagnostics;
 
 namespace CodeWalker.Rendering
 {
@@ -85,6 +86,85 @@ namespace CodeWalker.Rendering
         public ClipMapEntry ClipMapEntry;
         public Expression Expression;
         public Dictionary<ushort, RenderableModel> ModelBoneLinks;
+
+        // Expression VM — executes .yed bytecode to produce facial bone transforms
+        public ExpressionVm ExpressionVm;
+        private Expression _lastExpression; // track expression changes to re-init VM
+        private double _lastVmAnimTime = -1.0; // track time changes for delta time calculation
+
+        // Face animation track values captured from the animation loop.
+        // The VM needs these raw values (Track=24/25/26) as INPUT for Blend instructions.
+        // Without seeding these, the Blend reads zeros and produces no facial movement.
+        private Dictionary<(ushort BoneId, byte Track), Vector4> _faceTrackAnimValues = new Dictionary<(ushort, byte), Vector4>();
+
+        // Set of bone IDs that had face animation tracks (24/25/26) in the animation data.
+        // Only VM output for these bones should be applied to the skeleton — body bones
+        // (thigh rolls, arms, etc.) are handled by the animation system, not the VM.
+        private HashSet<ushort> _faceBoneIds = new HashSet<ushort>();
+
+        /// <summary>
+        /// Set to true to enable the expression VM execution.
+        /// When disabled, the animation loop's face track handling (T24/25/26) works normally.
+        /// </summary>
+        public static bool EnableExpressionVm = true;
+
+        // ── Expression VM tunable constants ──────────────────────────────────
+        // These scale factors compensate for the difference between how the
+        // animation loop and the VM produce face bone transforms.
+        //
+        // The animation loop's T=25 (face euler) multiplies euler angles by
+        // AnimFaceEulerMultiplier before converting to quaternion, producing small
+        // rotations. The VM's BlendQuaternion builds quaternions directly from raw
+        // euler values without this scaling, so its output is much larger.
+        // The VmRotScale* constants reduce VM rotation output to match.
+        //
+        // Similarly, the animation loop's T=24 (face position) uses a 0.005 scale,
+        // while the VM's BlendVector produces full-magnitude position values.
+        // VmPosScale reduces VM position output to match.
+
+        /// <summary>
+        /// Multiplier applied to euler angles before yaw/pitch/roll→quaternion
+        /// conversion in the animation loop's T=25 face euler track.
+        /// Value: -0.1π ≈ -0.31416. The negative sign and π factor are the
+        /// game's convention for face euler tracks.
+        /// </summary>
+        public const float AnimFaceEulerMultiplier = -0.314159265f;
+
+        /// <summary>
+        /// Multiplier applied to the single float from T=24 face position track
+        /// in the animation loop, converting it to a Y-axis translation offset.
+        /// </summary>
+        public const float AnimFacePositionScale = 0.005f;
+
+        /// <summary>
+        /// Rotation angle scale for VM output on NON-eye face bones (jaw, eyebrows, etc.).
+        /// Reduces the VM's over-large quaternion rotation to match the animation loop's
+        /// magnitude. Empirically tuned: 0.3 works well for bones with blend weight ≈ 0.5.
+        /// </summary>
+        public const float VmRotScaleFace = 0.3f;
+
+        /// <summary>
+        /// Rotation angle scale for VM output on EYE bones specifically.
+        /// Eye bones typically have blend weight ≈ 1.0, making the VM's output
+        /// ~6.4× too large. The correct scale = 0.1π / 2 ≈ 0.157.
+        /// Lower values = less eye rotation; higher = more.
+        /// </summary>
+        public const float VmRotScaleEye = 0.15f;
+
+        /// <summary>
+        /// Position offset scale for VM output on face bones.
+        /// The VM's BlendVector produces full-magnitude positions, while the
+        /// animation loop uses a 0.005 scale on T=24. This factor reduces
+        /// VM position offsets to a comparable magnitude.
+        /// </summary>
+        public const float VmPosScale = 0.3f;
+
+        /// <summary>
+        /// Maximum allowed position offset magnitude for face bones (VM output).
+        /// Offsets larger than this are clamped (skipped) to prevent vertices
+        /// from flying off to wrong positions.
+        /// </summary>
+        public const float VmPosMaxOffset = 0.5f;
 
         public bool EnableRootMotion = false; //used to toggle whether or not to include root motion when playing animations
         public Vector3 RootMotionPosition;
@@ -535,6 +615,13 @@ namespace CodeWalker.Rendering
             RootMotionPosition = Vector3.Zero;
             RootMotionRotation = Quaternion.Identity;
 
+            // Clear face track values for this frame — they'll be repopulated
+            // by the animation loop when it encounters face tracks (24/25/26).
+            // Must clear here (not in per-animation UpdateAnim) so that values
+            // from multiple animations in a ClipAnimationList are accumulated.
+            _faceTrackAnimValues.Clear();
+            _faceBoneIds.Clear();
+
             var clipanim = cme.Clip as ClipAnimation;
             if (clipanim?.Animation != null)
             {
@@ -562,9 +649,9 @@ namespace CodeWalker.Rendering
                     switch (bone.Tag)
                     {
                         case 23639: tag = 58271; break; //RB_L_ThighRoll: SKEL_L_Thigh
-                        case 6442:  tag = 51826; break; //RB_R_ThighRoll: SKEL_R_Thigh
-                        //case 61007: tag = 61163; break; //RB_L_ForeArmRoll: SKEL_L_Forearm //NOT GOOD
-                        //case 5232: tag = 45509; break; //RB_L_ArmRoll: SKEL_L_UpperArm
+                        case 6442: tag = 51826; break; //RB_R_ThighRoll: SKEL_R_Thigh
+                                                       //case 61007: tag = 61163; break; //RB_L_ForeArmRoll: SKEL_L_Forearm //NOT GOOD
+                                                       //case 5232: tag = 45509; break; //RB_L_ArmRoll: SKEL_L_UpperArm
                     }
                     if ((tag != bone.Tag) && (tag != bone.Parent?.Tag))
                     {
@@ -577,7 +664,7 @@ namespace CodeWalker.Rendering
                 for (int i = 0; i < bones.Length; i++)
                 {
                     var bone = bones[i];
-                    
+
                     if (EnableRootMotion && (bone.Tag == 0))
                     {
                         bone.AnimTranslation = RootMotionPosition + RootMotionRotation.Multiply(bone.AnimTranslation);
@@ -604,7 +691,7 @@ namespace CodeWalker.Rendering
 
         }
         private void UpdateAnim(Animation anim, float t)
-        { 
+        {
             if (anim == null)
             { return; }
             if (anim.BoneIds?.data_items == null)
@@ -622,6 +709,9 @@ namespace CodeWalker.Rendering
             if (bones == null)
             { return; }
 
+            // ── Expression VM ── (declaration only; execution moved after animation loop)
+            bool vmHasOutput = false;
+
             Vector4 v;
             Quaternion q;
 
@@ -638,12 +728,63 @@ namespace CodeWalker.Rendering
 
                     if ((track == 24) || (track == 25) || (track == 26))
                     {
+                        // Capture raw face track values for VM seeding, regardless of whether
+                        // the VM is active. The VM's Blend instructions need these raw animation
+                        // values as INPUT to compute face bone transforms. We capture them here
+                        // and also apply them to bones normally — the VM will later OVERRIDE
+                        // specific bones it produces output for. Bones the VM doesn't handle
+                        // keep their animation-applied values.
+                        if (EnableExpressionVm)
+                        {
+                            // Remap the animation bone ID to the skeleton bone ID.
+                            // The animation data uses Flags WITHOUT the 0x80 UnkFlag bit,
+                            // but BoneTracksDict keys have the 0x80 bit set for expression-internal
+                            // entries. Try lookup with the raw Flags first, then with 0x80 added.
+                            ushort faceSkelBoneId = boneid;
+                            if (Expression.BoneTracksDict.TryGetValue(exprbt, out var faceRemap))
+                            {
+                                faceSkelBoneId = faceRemap.BoneId;
+                            }
+                            else
+                            {
+                                // Try with 0x80 bit set (animation data doesn't include UnkFlag)
+                                var altKey = new ExpressionTrack() { BoneId = boneid, Track = track, Flags = (byte)(boneiditem.Unk0 | 0x80) };
+                                if (Expression.BoneTracksDict.TryGetValue(altKey, out var altRemap))
+                                {
+                                    faceSkelBoneId = altRemap.BoneId;
+                                }
+                            }
+                            _faceBoneIds.Add(faceSkelBoneId);
+
+                            switch (track)
+                            {
+                                case 24: // face position (single float)
+                                case 25: // face euler (vector3)
+                                    v = anim.EvaluateVector4(frame, i, interpolate);
+                                    _faceTrackAnimValues[(boneid, (byte)track)] = v;
+                                    break;
+                                case 26: // face quaternion
+                                    q = anim.EvaluateQuaternion(frame, i, interpolate);
+                                    _faceTrackAnimValues[(boneid, (byte)track)] = new Vector4(q.X, q.Y, q.Z, q.W);
+                                    break;
+                            }
+                            // DON'T continue — let face tracks fall through to be applied to
+                            // bones normally. The VM will override specific bones later.
+                            // Previously, skipping face tracks here meant bones the VM didn't
+                            // handle lost all animation, collapsing to bind pose.
+                        }
+
                         if (Expression.BoneTracksDict.TryGetValue(exprbt, out exprbtmap))
                         {
                             boneid = exprbtmap.BoneId;
                         }
                         else
-                        { }
+                        {
+                            // Try with 0x80 bit set (animation data doesn't include UnkFlag)
+                            var altKey = new ExpressionTrack() { BoneId = boneid, Track = track, Flags = (byte)(boneiditem.Unk0 | 0x80) };
+                            if (Expression.BoneTracksDict.TryGetValue(altKey, out exprbtmap))
+                                boneid = exprbtmap.BoneId;
+                        }
                     }
                 }
 
@@ -656,9 +797,6 @@ namespace CodeWalker.Rendering
                 if (bone == null)
                 {
                     continue;
-                    //skel.BoneTagsMap?.TryGetValue(boneiditem.BoneId, out bone);
-                    //if (bone == null)
-                    //{ continue; }
                 }
 
                 switch (track)
@@ -689,18 +827,23 @@ namespace CodeWalker.Rendering
                         break;
                     case 24://face stuff
                         v = anim.EvaluateVector4(frame, i, interpolate); //single float
-                        var fv = new Vector3(0, v.X * 0.005f, 0);//not sure about this
+                        var fv = new Vector3(0, v.X * AnimFacePositionScale, 0);//T=24 face position: Y-axis offset scaled by AnimFacePositionScale
                         bone.AnimTranslation = bone.Translation + bone.AnimRotation.Multiply(fv);//not sure about this
                         break;
                     case 25://face stuff
                         v = anim.EvaluateVector4(frame, i, interpolate); //vector3 roll/pitch/yaw
-                        var mult = -0.314159265f;
-                        q = Quaternion.RotationYawPitchRoll(v.Z * mult, v.Y * mult, v.X * mult);
+                        q = Quaternion.RotationYawPitchRoll(v.Z * AnimFaceEulerMultiplier, v.Y * AnimFaceEulerMultiplier, v.X * AnimFaceEulerMultiplier);
+                        // Ensure consistent quaternion hemisphere to prevent eye/face bone flipping
+                        if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
                         bone.AnimRotation = bone.Rotation * q;
                         break;
                     case 26://face stuff
                         q = anim.EvaluateQuaternion(frame, i, interpolate);
-                        bone.AnimRotation = bone.Rotation * q;//is this right?
+                        // Ensure consistent quaternion hemisphere to prevent eye/face bone flipping.
+                        // The animation data may return q or -q between frames (same rotation,
+                        // different sign), which causes bone.Rotation * q to jump ~180°.
+                        if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
+                        bone.AnimRotation = bone.Rotation * q;
                         break;
                     case 27:
                     case 50:
@@ -720,6 +863,478 @@ namespace CodeWalker.Rendering
                 }
             }
 
+            // ── Expression VM execution (AFTER animation loop) ────────────
+            // The animation loop has set up all bone transforms. Now the expression VM
+            // computes facial expression deltas and overrides face bone transforms.
+            //
+            // The VM outputs DELTAS from bind pose for face tracks (24/25/26), the same
+            // format as the animation data. We apply them the same way: bind + delta.
+            //
+            // Body tracks (0/1) are seeded with animated values for TrackGet lookups
+            // (e.g., the VM reads head position for lookAt calculations). Face tracks
+            // are left at zero/identity defaults — the VM computes face deltas from
+            // expression parameters (time, weight, variables), not from the current
+            // animated state of face bones.
+            if (EnableExpressionVm && Expression != null && Expression.Streams?.data_items != null && Expression.Streams.data_items.Length > 0)
+            {
+                try
+                {
+                    bool isInit = (ExpressionVm == null || _lastExpression != Expression);
+
+                    // Initialize or update the VM
+                    if (isInit)
+                    {
+                        ExpressionVm = new ExpressionVm();
+                        ExpressionVm.Weight = 1.0f;
+                        ExpressionVm.Init(Expression, 0, t, 1f / 30f);
+                        _lastExpression = Expression;
+                    }
+
+                    // Calculate delta time
+                    float deltaTime = 1f / 30f;
+                    if (_lastVmAnimTime >= 0.0)
+                    {
+                        deltaTime = Math.Max(0.001f, (float)(CurrentAnimTime - _lastVmAnimTime));
+                    }
+                    _lastVmAnimTime = CurrentAnimTime;
+
+                    // Reset VM for this frame (keeps spring state, clears tracks to defaults)
+                    ExpressionVm.ResetForFrame(t, deltaTime);
+
+                    // ── Build format lookup from Expression.Tracks ──
+                    // BoneTracksDict keys use the FULL Flags byte (including the 0x80 UnkFlag bit).
+                    // We MUST store et.Flags (not et.Format) so that lookups match the dict keys.
+                    // Previously, storing et.Format (= Flags & 0x7F) meant lookups always missed
+                    // UnkFlag=True entries, so remapping NEVER worked and expression-internal
+                    // bone IDs were used directly as skeleton IDs — destroying faces.
+                    var exprTrackFormats = new Dictionary<(ushort, byte), byte>();
+                    if (Expression.Tracks?.data_items != null)
+                    {
+                        foreach (var et in Expression.Tracks.data_items)
+                        {
+                            var fk = (et.BoneId, et.Track);
+                            if (!exprTrackFormats.ContainsKey(fk))
+                                exprTrackFormats[fk] = et.Flags; // FULL Flags with 0x80 bit!
+                        }
+                    }
+
+                    // ── Enrich _faceBoneIds from Expression.Tracks ──
+                    // _faceBoneIds is initially populated from animation T=24/25/26 tracks.
+                    // However, those IDs are animation channel bone IDs (like 2719, 5804) which
+                    // may NOT match the skeleton bone IDs that the VM outputs (like 39308, 38849).
+                    // We need to add the skeleton bone IDs that the expression outputs face data to.
+                    //
+                    // Strategy: iterate BoneTracksDict. Any "mapto" (Value) entry that has a
+                    // T>=24 source (Key) mapping to it is a face skeleton bone. Also, animation
+                    // face track bone IDs that ARE in BoneTracksDict map to skeleton bones.
+                    if (Expression.BoneTracksDict != null)
+                    {
+                        foreach (var kvp in Expression.BoneTracksDict)
+                        {
+                            var source = kvp.Key;   // UnkFlag=True entry (expression-internal)
+                            var target = kvp.Value; // UnkFlag=False entry (skeleton bone)
+
+                            // If the SOURCE has T>=24, the TARGET is a face skeleton bone
+                            if (source.Track >= 24 && source.Track <= 26)
+                            {
+                                _faceBoneIds.Add(target.BoneId);
+                            }
+                        }
+                    }
+
+                    // ── Enrich _faceBoneIds from expression track definitions ──
+                    // The VM outputs facial expression data for bones that may NOT be in
+                    // _faceBoneIds (which was populated from animation T=24/25/26 tracks and
+                    // BoneTracksDict targets). Eye bones, jaw, and many other face expression
+                    // bones are written by the VM but don't appear in the animation's face
+                    // tracks — they're UnkFlag=False tracks in the expression that use skeleton
+                    // bone IDs directly. If we don't add them, the "not a face bone" gate skips
+                    // their VM output, leaving eyes looking wrong and mouths not opening.
+                    //
+                    // PREVIOUS APPROACH: added ALL bones from VM OutputTracks to _faceBoneIds.
+                    // This was TOO AGGRESSIVE — it added body bones too, and when their transforms
+                    // were overwritten by VM output applied as "absolute from bind pose," body
+                    // parts shifted wildly, causing facial vertices to "explode."
+                    //
+                    // NEW APPROACH: add skeleton bone IDs from the expression's UnkFlag=False
+                    // track definitions with T<=2. These are skeleton bones the expression
+                    // modifies directly. Since expressions are for facial animation, these
+                    // should all be face bones. We verify each bone exists in the skeleton.
+                    var bonesMapPre = skel?.BonesMap;
+                    if (Expression.Tracks?.data_items != null && bonesMapPre != null)
+                    {
+                        foreach (var et in Expression.Tracks.data_items)
+                        {
+                            if (et.UnkFlag) continue;      // expression-internal, already handled via BoneTracksDict
+                            if (et.Track > 2) continue;     // T=24/25/26 are input channels, not output bones
+                            if (bonesMapPre.ContainsKey(et.BoneId))
+                                _faceBoneIds.Add(et.BoneId);
+                        }
+                    }
+
+                    // ── Seed VM with current bone transforms ──
+                    // Expression tracks use Track=0/1/2 as FORMAT indicators (pos/rot/scale).
+                    // All expression tracks need seeding so the VM can read current bone state
+                    // via TrackGet. For tracks with UnkFlag=True (expression-internal bone IDs),
+                    // we remap through BoneTracksDict to find the skeleton bone.
+                    var bonesMap = skel?.BonesMap;
+                    int seedCount = 0;
+                    int faceSeedCount = 0;
+                    var seedData = new Dictionary<(ushort, byte), Vector4>();
+
+                    if (bonesMap != null && Expression.Tracks?.data_items != null)
+                    {
+                        foreach (var exprTrack in Expression.Tracks.data_items)
+                        {
+                            // Seed position/rotation/scale tracks (Track=0/1/2)
+                            if (exprTrack.Track > 2 && exprTrack.Track < 24) continue;
+
+                            // Track 24/25/26 are face animation channels — seeded from animation data below
+                            if (exprTrack.Track >= 24) continue;
+
+                            // Resolve the skeleton bone for this expression track.
+                            // UnkFlag=True means the bone ID is expression-internal → remap via BoneTracksDict.
+                            // UnkFlag=False means the bone ID is already a skeleton bone ID.
+                            ushort lookupBoneId = exprTrack.BoneId;
+                            var lookupKey = new ExpressionTrack() { BoneId = exprTrack.BoneId, Track = exprTrack.Track, Flags = exprTrack.Format };
+                            if (exprTrack.UnkFlag && Expression.BoneTracksDict != null && Expression.BoneTracksDict.TryGetValue(lookupKey, out var mapped))
+                            {
+                                lookupBoneId = mapped.BoneId;
+                            }
+
+                            Bone skelBone = null;
+                            bonesMap.TryGetValue(lookupBoneId, out skelBone);
+                            if (skelBone == null)
+                                continue;
+
+                            // ── CRITICAL: Do NOT seed face bone T=0/1/2 tracks with animated values ──
+                            // The VM uses TrackSetOffset for position (ADD to current) and TrackSet for
+                            // rotation (REPLACE). If we seed face bone tracks with AnimTranslation/
+                            // AnimRotation (which include bind pose data), the TrackSetOffset output
+                            // becomes "bindTranslation + vmOffset". When we then apply as
+                            // "bone.Translation + bone.Rotation * vmOutput", we get DOUBLE bind
+                            // translation — once directly, once rotated by bindRotation. This pushes
+                            // facial vertices way off their correct positions.
+                            //
+                            // Instead, leave face bone tracks at their ResetForFrame defaults:
+                            //   T=0 (position): Vector4.Zero  — TrackSetOffset starts from zero
+                            //   T=1 (rotation): Vector4(0,0,0,1) — identity quaternion
+                            // The VM's TrackSetOffset then produces just the computed offset, which
+                            // we apply correctly as "bind + offset".
+                            //
+                            // Body bone tracks (NOT in _faceBoneIds) are still seeded with animated
+                            // values because the VM may read them via TrackGet for lookAt etc.
+                            if (_faceBoneIds.Contains(lookupBoneId))
+                                continue;
+
+                            switch (exprTrack.Track)
+                            {
+                                case 0: // position
+                                    var trans = skelBone.AnimTranslation;
+                                    seedData[(exprTrack.BoneId, exprTrack.Track)] = new Vector4(trans.X, trans.Y, trans.Z, 0);
+                                    seedCount++;
+                                    break;
+                                case 1: // rotation (quaternion)
+                                    var rot = skelBone.AnimRotation;
+                                    seedData[(exprTrack.BoneId, exprTrack.Track)] = new Vector4(rot.X, rot.Y, rot.Z, rot.W);
+                                    seedCount++;
+                                    break;
+                                case 2: // scale
+                                    var scale = skelBone.AnimScale;
+                                    seedData[(exprTrack.BoneId, exprTrack.Track)] = new Vector4(scale.X, scale.Y, scale.Z, 0);
+                                    seedCount++;
+                                    break;
+                            }
+                        }
+                    }
+
+                    // ── Seed VM with face animation track values (Track=24/25/26) ──
+                    // These are the RAW animation values captured from the animation loop.
+                    // The VM's Blend instructions read these as INPUT to compute face bone
+                    // transforms. Without this seeding, all face track values are zero and
+                    // Blend produces zero output — no facial expressions visible.
+                    if (_faceTrackAnimValues.Count > 0)
+                    {
+                        foreach (var ftkv in _faceTrackAnimValues)
+                        {
+                            seedData[ftkv.Key] = ftkv.Value;
+                            faceSeedCount++;
+                        }
+                    }
+
+                    // Also seed face tracks that are referenced in the expression's Tracks list
+                    // but might not have been captured from the animation loop (e.g., if the
+                    // animation clip doesn't contain all face channels).
+                    if (Expression.Tracks?.data_items != null)
+                    {
+                        foreach (var exprTrack in Expression.Tracks.data_items)
+                        {
+                            if (exprTrack.Track < 24) continue; // only face animation channels
+
+                            var faceKey = (exprTrack.BoneId, (byte)exprTrack.Track);
+                            if (!seedData.ContainsKey(faceKey))
+                            {
+                                // This face channel wasn't in the animation clip — seed with zero.
+                                // Format 0/2 = vector/float → zero, Format 1 = quaternion → identity
+                                seedData[faceKey] = (exprTrack.Format == 1)
+                                    ? new Vector4(0, 0, 0, 1)
+                                    : Vector4.Zero;
+                                faceSeedCount++;
+                            }
+                        }
+                    }
+
+                    ExpressionVm.SeedTracks(seedData);
+
+                    // Execute the VM
+                    ExpressionVm.RunAllStreams(t, deltaTime);
+                    vmHasOutput = ExpressionVm.Tracks.Count > 0;
+
+                    // ── Apply VM track outputs to skeleton bones ────────────────
+                    // In the expression system, Track numbers are FORMAT indicators:
+                    //   Track=0 → position (Vector3), Track=1 → rotation (Quaternion),
+                    //   Track=2 → scale (Vector3)
+                    // They are NOT the same as animation track types (0=body pos, 1=body rot,
+                    // 24=face pos, 25=face euler, 26=face quat). Face vs body is determined
+                    // by BoneTracksDict membership, not by track type.
+                    //
+                    // UnkFlag=True tracks (0x80 bit set in Flags) are expression-internal bone
+                    // IDs that MUST be remapped through BoneTracksDict to get skeleton bone IDs.
+                    // UnkFlag=False tracks already use skeleton bone IDs directly.
+                    //
+                    // The animation loop now applies face tracks (24/25/26) normally, so
+                    // face bones have their animation-applied values. The VM OVERRIDES only
+                    // the specific face bones it produces output for. Bones the VM doesn't
+                    // handle keep their normal animation values (no more collapsing to bind).
+                    //
+                    // VM output is applied ABSOLUTELY from bind pose:
+                    //   Track=0 (position): bone.AnimTranslation = bone.Translation + bone.Rotation * offset
+                    //   Track=1 (rotation): bone.AnimRotation = bone.Rotation * deltaQuat
+                    // This matches the original animation behavior for face tracks.
+                    int appliedCount = 0;
+                    int remapSuccess = 0;
+                    int remapFail = 0;
+                    int boneNotFound = 0;
+                    int valueTooSmall = 0;
+                    int validRotBoneCount = 0;
+                    var bonesMapPost = skel?.BonesMap;
+
+                    if (vmHasOutput && bonesMapPost != null)
+                    {
+                        // ── Pre-scan: build set of bones with VALID VM rotation output ──
+                        // Some expression bones have their T=1 (rotation) track set to (0,0,0,0) —
+                        // a zero quaternion which is NOT a valid rotation. These bones use T=1/T=2
+                        // as parameter channels (spring targets, morph weights), NOT as actual
+                        // rotation/scale transforms. Their T=0 (position) values (like -0.03 on all
+                        // axes) are also parameter values, not real position offsets. Applying them
+                        // as position offsets shifts face vertices systematically to one side.
+                        //
+                        // Solution: only apply VM position for bones that ALSO have a valid rotation.
+                        // If a bone's rotation is an invalid zero quaternion, both its position and
+                        // rotation are parameter data — skip both and let the animation-applied
+                        // values stand (the animation loop already handles T=24/25/26 face tracks).
+                        var bonesWithValidRotation = new HashSet<ushort>();
+                        foreach (var preKey in ExpressionVm.OutputTracks)
+                        {
+                            var (preBoneId, preTrack, preComp) = preKey;
+                            if (preComp != 0 || preTrack != 1) continue; // only check T=1 rotation tracks
+
+                            Vector4 preVal;
+                            if (!ExpressionVm.Tracks.TryGetValue(preKey, out preVal)) continue;
+
+                            // Check if this is a valid quaternion (not zero, not wildly unnormalized)
+                            var preLenSq = preVal.X * preVal.X + preVal.Y * preVal.Y + preVal.Z * preVal.Z + preVal.W * preVal.W;
+                            if (preLenSq >= 0.0001f && Math.Abs(preLenSq - 1.0f) <= 0.5f)
+                            {
+                                // Resolve skeleton bone ID (same logic as below)
+                                ushort preSkelId = preBoneId;
+                                byte preFormat;
+                                if (exprTrackFormats.TryGetValue((preBoneId, (byte)preTrack), out preFormat))
+                                {
+                                    var preLookup = new ExpressionTrack() { BoneId = preBoneId, Track = (byte)preTrack, Flags = (byte)(preFormat & 0x7F) };
+                                    if (Expression.BoneTracksDict != null && Expression.BoneTracksDict.TryGetValue(preLookup, out var preMapped))
+                                        preSkelId = preMapped.BoneId;
+                                }
+                                bonesWithValidRotation.Add(preSkelId);
+                            }
+                        }
+                        validRotBoneCount = bonesWithValidRotation.Count;
+
+                        // ── TWO-PASS APPLICATION: Rotations first, then Positions ──
+                        // The original animation code for T=24 (face position) uses
+                        // bone.AnimRotation to rotate the position offset:
+                        //   bone.AnimTranslation = bone.Translation + bone.AnimRotation * fv
+                        // At that point, AnimRotation has already been set by T=25/26.
+                        // We must do the same: apply rotations FIRST so that when we
+                        // apply positions, AnimRotation includes the VM's computed rotation.
+                        //
+                        // CRITICAL: Only iterate tracks that the VM WROTE via TrackSet/TrackSetOffset/
+                        // TrackSetComp/TrackSetBoneTransform. Do NOT iterate all Tracks entries,
+                        // because Tracks also contains seeded INPUT values (bone rotations read by
+                        // TrackGet). Applying seeded inputs as output causes body bones (thighs,
+                        // hips, arms) to spin because their rotation gets applied as a delta on
+                        // top of itself: bone.Rotation * seededRotation = double rotation.
+
+                        // ── PASS 1: Apply rotations (T=1) ──
+                        foreach (var outKey in ExpressionVm.OutputTracks)
+                        {
+                            var (exprBoneId, trackType, compIdx) = outKey;
+                            if (compIdx != 0 || trackType != 1) continue; // only T=1 rotation
+
+                            Vector4 val;
+                            if (!ExpressionVm.Tracks.TryGetValue(outKey, out val)) continue;
+
+                            ushort skelBoneId = exprBoneId;
+                            bool didRemap = false;
+                            byte format = 0;
+
+                            if (exprTrackFormats.TryGetValue((exprBoneId, trackType), out format))
+                            {
+                                var lookup = new ExpressionTrack() { BoneId = exprBoneId, Track = trackType, Flags = (byte)(format & 0x7F) };
+                                if (Expression.BoneTracksDict != null && Expression.BoneTracksDict.TryGetValue(lookup, out var mapped))
+                                {
+                                    skelBoneId = mapped.BoneId;
+                                    didRemap = true;
+                                    remapSuccess++;
+                                }
+                            }
+                            else { continue; }
+
+                            if (!didRemap && !_faceBoneIds.Contains(skelBoneId))
+                                continue;
+
+                            Bone targetBone = null;
+                            bonesMapPost.TryGetValue(skelBoneId, out targetBone);
+                            if (targetBone == null) { boneNotFound++; continue; }
+
+                            var vmQuat = new Quaternion(val.X, val.Y, val.Z, val.W);
+                            var lenSq = vmQuat.LengthSquared();
+                            if (lenSq < 0.0001f || Math.Abs(lenSq - 1.0f) > 0.5f)
+                            {
+                                valueTooSmall++;
+                                continue;
+                            }
+                            vmQuat = Quaternion.Normalize(vmQuat);
+                            // Ensure consistent hemisphere (W >= 0) to prevent bone flipping.
+                            // The VM's BlendQuaternion may produce quaternions with W < 0,
+                            // which represent the same rotation as -q (W > 0) but cause
+                            // bone.Rotation * q to jump ~180° when mixed with bind pose.
+                            if (vmQuat.W < 0) vmQuat = new Quaternion(-vmQuat.X, -vmQuat.Y, -vmQuat.Z, -vmQuat.W);
+
+                            // Scale VM rotation output to match animation loop's magnitude.
+                            // The animation loop's T=25 (face euler) applies a -0.1π multiplier
+                            // before converting euler→quaternion. The VM's BlendQuaternion
+                            // produces quaternion components at full magnitude because it
+                            // processes raw animation values without this scaling.
+                            //
+                            // For weight=1.0 bones (e.g. eyes), the VM produces ~6.4x too much
+                            // rotation. The correct rotScale = 0.1π / 2 ≈ 0.157.
+                            // For weight≈0.5 bones (e.g. jaw), rotScale=0.3 happens to work
+                            // because the lower weight compensates.
+                            // Eye bones are especially sensitive — even 2x amplification is very
+                            // visible. Use the mathematically correct scale for eye bones.
+                            bool isEyeBone = !string.IsNullOrEmpty(targetBone.Name) &&
+                                targetBone.Name.IndexOf("Eye", StringComparison.OrdinalIgnoreCase) >= 0;
+                            float rotScale = isEyeBone ? VmRotScaleEye : VmRotScaleFace;
+                            float vmAngle = 2.0f * (float)Math.Acos(Math.Min(1.0f, Math.Abs(vmQuat.W)));
+                            if (vmAngle > 0.001f)
+                            {
+                                float scaledAngle = vmAngle * rotScale;
+                                float sinHalf = (float)Math.Sin(scaledAngle / 2.0f);
+                                float cosHalf = (float)Math.Cos(scaledAngle / 2.0f);
+                                float axisScale = (vmAngle > 0.0001f) ? sinHalf / (float)Math.Sin(vmAngle / 2.0f) : 1.0f;
+                                vmQuat = new Quaternion(
+                                    vmQuat.X * axisScale,
+                                    vmQuat.Y * axisScale,
+                                    vmQuat.Z * axisScale,
+                                    cosHalf * Math.Sign(vmQuat.W));
+                                vmQuat = Quaternion.Normalize(vmQuat);
+                            }
+
+                            // Apply as delta from bind pose: bind rotation * VM delta quaternion.
+                            // The VM's TrackSet replaces the identity default, so the output is
+                            // just the computed rotation delta. This matches the animation loop's
+                            // T=25/26 face rotation: bone.AnimRotation = bone.Rotation * q;
+                            targetBone.AnimRotation = Quaternion.Normalize(
+                                targetBone.Rotation * vmQuat);
+                            appliedCount++;
+                        }
+
+                        // ── PASS 2: Apply positions (T=0) using updated AnimRotation ──
+                        foreach (var outKey in ExpressionVm.OutputTracks)
+                        {
+                            var (exprBoneId, trackType, compIdx) = outKey;
+                            if (compIdx != 0 || trackType != 0) continue; // only T=0 position
+
+                            Vector4 val;
+                            if (!ExpressionVm.Tracks.TryGetValue(outKey, out val)) continue;
+
+                            ushort skelBoneId = exprBoneId;
+                            bool didRemap = false;
+                            byte format = 0;
+
+                            if (exprTrackFormats.TryGetValue((exprBoneId, trackType), out format))
+                            {
+                                var lookup = new ExpressionTrack() { BoneId = exprBoneId, Track = trackType, Flags = (byte)(format & 0x7F) };
+                                if (Expression.BoneTracksDict != null && Expression.BoneTracksDict.TryGetValue(lookup, out var mapped))
+                                {
+                                    skelBoneId = mapped.BoneId;
+                                    didRemap = true;
+                                }
+                            }
+                            else { continue; }
+
+                            if (!didRemap && !_faceBoneIds.Contains(skelBoneId))
+                            {
+                                continue; // skip body bone (already logged in pass 1)
+                            }
+
+                            // Skip position for bones with invalid rotation (parameter channels)
+                            if (!bonesWithValidRotation.Contains(skelBoneId))
+                            {
+                                valueTooSmall++;
+                                continue;
+                            }
+
+                            Bone targetBone = null;
+                            bonesMapPost.TryGetValue(skelBoneId, out targetBone);
+                            if (targetBone == null) { boneNotFound++; continue; }
+
+                            var posOffset = new Vector3(val.X, val.Y, val.Z);
+                            // Scale position offset to match animation loop's magnitude.
+                            // The animation loop's T=24 applies a 0.005f scale to position values.
+                            // The VM's BlendVector produces position values at full magnitude.
+                            posOffset *= VmPosScale;
+                            // Safety clamp: face bone offsets should be small.
+                            float maxOffset = VmPosMaxOffset;
+                            if (posOffset.Length() > maxOffset)
+                            {
+                                valueTooSmall++;
+                                continue;
+                            }
+                            // Apply position offset using the VM's computed rotation (AnimRotation).
+                            // Pass 1 already set AnimRotation = bindRotation * vmDeltaQuat.
+                            // This matches the animation loop's T=24 face position:
+                            //   bone.AnimTranslation = bone.Translation + bone.AnimRotation * fv
+                            // Using AnimRotation ensures the offset is in the correct direction
+                            // relative to the face's actual (animated) orientation, not the bind pose.
+                            targetBone.AnimTranslation = targetBone.Translation + targetBone.AnimRotation.Multiply(posOffset);
+                            appliedCount++;
+                        }
+                    }
+
+                    // NOTE: We do NOT auto-disable the VM when debug logging finishes.
+                    // The debug logger and the VM are separate concerns — the VM must keep
+                    // running to produce facial expressions even after diagnostic logging ends.
+                    // Previously, disabling the VM here caused faces to lose all expressions
+                    // after just 3 frames of debug output.
+                }
+                catch (Exception vmEx)
+                {
+                    Debug.WriteLine($"[Renderable] EXCEPTION in VM execution: {vmEx.GetType().Name}: {vmEx.Message}\n{vmEx.StackTrace}");
+                    // If VM execution fails, animation loop already applied face data
+                }
+            }
 
         }
         private void UpdateAnimUV(ClipMapEntry cme, RenderableGeometry rgeom = null)
@@ -1074,7 +1689,7 @@ namespace CodeWalker.Rendering
                                 specularFalloffMult = ((Vector4)param.Data).X;
                                 break;
                             case ShaderParamNames.specularFresnel: //float
-                                specularFresnel= ((Vector4)param.Data).X;
+                                specularFresnel = ((Vector4)param.Data).X;
                                 break;
                             case ShaderParamNames.WindGlobalParams:
                             case ShaderParamNames.umGlobalOverrideParams:
@@ -1447,7 +2062,7 @@ namespace CodeWalker.Rendering
             var bones = Owner?.Skeleton?.BonesMap;
             bones?.TryGetValue(l.BoneId, out Bone);
             Position = pos;
-            Colour = new Vector3(l.ColorR, l.ColorG, l.ColorB) * (2.0f * l.Intensity  / 255.0f);
+            Colour = new Vector3(l.ColorR, l.ColorG, l.ColorB) * (2.0f * l.Intensity / 255.0f);
             Direction = dir;
             TangentX = tan;
             TangentY = Vector3.Normalize(Vector3.Cross(l.Direction, TangentX));
@@ -1557,7 +2172,7 @@ namespace CodeWalker.Rendering
             if (ll == null) return;
             if (dll == null) return;
 
-            if (ll.LodLights == null) 
+            if (ll.LodLights == null)
             { return; }
 
             var n = ll.LodLights.Length;
@@ -1658,7 +2273,7 @@ namespace CodeWalker.Rendering
             public uint Colour;
         }
 
-        private DistLODLight[] InstanceData { get; set; } 
+        private DistLODLight[] InstanceData { get; set; }
         public GpuSBuffer<DistLODLight> InstanceBuffer { get; set; }
         public int InstanceCount { get; set; }
         public ushort Category { get; set; }
@@ -1986,7 +2601,7 @@ namespace CodeWalker.Rendering
         }
 
         private void InitBoundComp(BoundComposite bound)
-        { 
+        {
             if (bound.Children == null)
             {
                 return;
@@ -2137,17 +2752,22 @@ namespace CodeWalker.Rendering
             {
                 if (bgeom.Polygons[i] == null) continue;
                 var type = bgeom.Polygons[i].Type;
-                switch(type)
+                switch (type)
                 {
-                    case BoundPolygonType.Triangle: rvertcount += 3;
+                    case BoundPolygonType.Triangle:
+                        rvertcount += 3;
                         break;
-                    case BoundPolygonType.Sphere: rspherecount++;
+                    case BoundPolygonType.Sphere:
+                        rspherecount++;
                         break;
-                    case BoundPolygonType.Capsule: rcapsulecount++;
+                    case BoundPolygonType.Capsule:
+                        rcapsulecount++;
                         break;
-                    case BoundPolygonType.Box: rboxcount++;
+                    case BoundPolygonType.Box:
+                        rboxcount++;
                         break;
-                    case BoundPolygonType.Cylinder: rcylindercount++;
+                    case BoundPolygonType.Cylinder:
+                        rcylindercount++;
                         break;
                 }
             }
@@ -2242,7 +2862,7 @@ namespace CodeWalker.Rendering
             }
 
             Vertices = rverts;
-            VertexCount = (rverts!=null) ? rverts.Length : 0;
+            VertexCount = (rverts != null) ? rverts.Length : 0;
 
             Boxes = rboxes;
             Spheres = rspheres;

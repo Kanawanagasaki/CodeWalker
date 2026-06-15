@@ -155,14 +155,13 @@ namespace CodeWalker.World
 
             Cutscene = cs;
 
+            Playing = false;
+            PlayStopButton.Text = "Play";
+            PlaybackTimer.Enabled = false;
+
             if (cs != null)
             {
                 cs.EnableSubtitles = EnableSubtitles;
-
-                if (Playing)
-                {
-                    PlayAudio(cs.PlaybackTime);
-                }
             }
 
             LoadTreeView(cs);

@@ -5,6 +5,7 @@
     <TargetFramework>net48</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <UseWPF>true</UseWPF>
+    <GenerateResourceUsePreserializedResources>true</GenerateResourceUsePreserializedResources>
     <ApplicationIcon>CW.ico</ApplicationIcon>
     <Copyright>dexyfex</Copyright>
     <Company>dexyfex software</Company>
@@ -26,6 +27,7 @@
     <PackageReference Include="SharpDX.Mathematics" Version="4.2.0" />
     <PackageReference Include="SharpDX.XAudio2" Version="4.2.0" />
     <PackageReference Include="SharpDX.XInput" Version="4.2.0" />
+    <PackageReference Include="System.Resources.Extensions" Version="10.0.9" />
   </ItemGroup>
 
   <ItemGroup>
