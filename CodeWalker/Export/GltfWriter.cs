@@ -22,6 +22,14 @@ namespace CodeWalker.Export
     /// </summary>
     public static class GltfWriter
     {
+        // ── Expression VM tunable constants (must match Renderable.cs) ──
+        // These scale factors compensate for the difference between how the
+        // animation loop and the VM produce face bone transforms.
+        const float VmRotScaleFace = 0.3f;
+        const float VmRotScaleEye = 0.15f;
+        const float VmPosScale = 0.3f;
+        const float VmPosMaxOffset = 0.5f;
+
         #region glTF Data Structures
 
         public class GltfScene
@@ -701,6 +709,12 @@ namespace CodeWalker.Export
             // Track which bone tags have rotation channels for ThighRoll copy
             var rotationBoneTags = new HashSet<ushort>();
 
+            // Capture raw face track values (T=24/25/26) per (BoneId, Track) per frame for VM seeding.
+            // The VM's Blend instructions need these raw animation values as INPUT to compute
+            // face bone transforms. Without seeding, the VM produces zero/identity output.
+            // Key: (animBoneId, track) → array of per-frame Vector4 values
+            var faceTrackAnimValues = new Dictionary<(ushort BoneId, byte Track), Vector4[]>();
+
             // Process each sub-animation, just like the renderer does.
             foreach (var subAnim in subAnimations)
             {
@@ -728,6 +742,14 @@ namespace CodeWalker.Export
                             var exprbt = new ExpressionTrack() { BoneId = boneId.BoneId, Track = boneId.Track, Flags = boneId.Unk0 };
                             if (btDict.TryGetValue(exprbt, out var exprbtmap))
                                 effectiveBoneId = exprbtmap.BoneId;
+                            else
+                            {
+                                // Try with 0x80 bit set (animation data doesn't include UnkFlag)
+                                // This matches the renderer's fallback logic in Renderable.cs
+                                var altKey = new ExpressionTrack() { BoneId = boneId.BoneId, Track = boneId.Track, Flags = (byte)(boneId.Unk0 | 0x80) };
+                                if (btDict.TryGetValue(altKey, out var altRemap))
+                                    effectiveBoneId = altRemap.BoneId;
+                            }
                         }
                     }
 
@@ -804,6 +826,7 @@ namespace CodeWalker.Export
                         // as bind-pose translation + rotated offset, then convert to glTF coordinates.
                         if (bone == null) continue;
                         var vals = new List<float>(frameCount * 3);
+                        var faceVals = new Vector4[frameCount];
                         for (int f = 0; f < frameCount; f++)
                         {
                             try
@@ -811,15 +834,18 @@ namespace CodeWalker.Export
                                 float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
                                 var fp = animData.GetFramePosition(t);
                                 var v4 = animData.EvaluateVector4(fp, bi, true);
+                                faceVals[f] = v4; // capture raw for VM seeding
                                 var fv = new Vector3(0, v4.X * 0.005f, 0);
                                 var animTrans = bone.Translation + bone.Rotation.Multiply(fv);
                                 vals.Add(animTrans.X); vals.Add(animTrans.Z); vals.Add(-animTrans.Y);
                             }
                             catch
                             {
+                                faceVals[f] = Vector4.Zero;
                                 vals.Add(bone.Translation.X); vals.Add(bone.Translation.Z); vals.Add(-bone.Translation.Y);
                             }
                         }
+                        faceTrackAnimValues[(boneId.BoneId, (byte)boneId.Track)] = faceVals;
                         // Later track for same node+path overrides earlier (matches renderer: last writer wins)
                         channelData[(nodeIdx, "translation")] = vals;
                     }
@@ -832,6 +858,7 @@ namespace CodeWalker.Export
                         if (bone == null) continue;
                         var vals = new List<float>(frameCount * 4);
                         float mult = -0.314159265f;
+                        var faceVals = new Vector4[frameCount];
                         for (int f = 0; f < frameCount; f++)
                         {
                             try
@@ -839,15 +866,20 @@ namespace CodeWalker.Export
                                 float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
                                 var fp = animData.GetFramePosition(t);
                                 var v4 = animData.EvaluateVector4(fp, bi, true);
+                                faceVals[f] = v4; // capture raw for VM seeding
                                 var q = Quaternion.RotationYawPitchRoll(v4.Z * mult, v4.Y * mult, v4.X * mult);
+                                // Ensure consistent quaternion hemisphere to prevent face bone flipping
+                                if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
                                 var animRot = bone.Rotation * q;
                                 vals.Add(animRot.X); vals.Add(animRot.Z); vals.Add(-animRot.Y); vals.Add(animRot.W);
                             }
                             catch
                             {
+                                faceVals[f] = Vector4.Zero;
                                 vals.Add(bone.Rotation.X); vals.Add(bone.Rotation.Z); vals.Add(-bone.Rotation.Y); vals.Add(bone.Rotation.W);
                             }
                         }
+                        faceTrackAnimValues[(boneId.BoneId, (byte)boneId.Track)] = faceVals;
                         // Facial rotation overrides body rotation for the same bone (matches renderer)
                         channelData[(nodeIdx, "rotation")] = vals;
                         rotationBoneTags.Add(lookupBoneId);
@@ -857,6 +889,7 @@ namespace CodeWalker.Export
                         // Renderable.cs: bone.AnimRotation = bone.Rotation * q
                         if (bone == null) continue;
                         var vals = new List<float>(frameCount * 4);
+                        var faceVals = new Vector4[frameCount];
                         for (int f = 0; f < frameCount; f++)
                         {
                             try
@@ -864,19 +897,36 @@ namespace CodeWalker.Export
                                 float t = GetSubAnimPlaybackTime(f * frameDelta, subAnim.StartTime, subAnim.EndTime);
                                 var fp = animData.GetFramePosition(t);
                                 var q = animData.EvaluateQuaternion(fp, bi, true);
+                                faceVals[f] = new Vector4(q.X, q.Y, q.Z, q.W); // capture raw for VM seeding
+                                // Ensure consistent quaternion hemisphere to prevent face bone flipping
+                                if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
                                 var animRot = bone.Rotation * q;
                                 vals.Add(animRot.X); vals.Add(animRot.Z); vals.Add(-animRot.Y); vals.Add(animRot.W);
                             }
                             catch
                             {
+                                faceVals[f] = new Vector4(0, 0, 0, 1);
                                 vals.Add(bone.Rotation.X); vals.Add(bone.Rotation.Z); vals.Add(-bone.Rotation.Y); vals.Add(bone.Rotation.W);
                             }
                         }
+                        faceTrackAnimValues[(boneId.BoneId, (byte)boneId.Track)] = faceVals;
                         channelData[(nodeIdx, "rotation")] = vals;
                         rotationBoneTags.Add(lookupBoneId);
                     }
                 }
             }
+
+            // ── Expression VM execution (AFTER animation track loop) ────────
+            // The animation loop above has set up all bone channel data from raw tracks.
+            // Now the expression VM computes facial expression deltas and overrides face
+            // bone channels — matching the renderer's UpdateAnim() behavior exactly.
+            //
+            // Without the VM, only direct face animation tracks (T=24/25/26) contribute
+            // to facial bone channels. Many facial bones (eyes, jaw, eyebrows, etc.) are
+            // animated exclusively by the VM's expression bytecode, not by direct tracks.
+            // The VM must run per-frame with proper seeding to produce correct output.
+            ApplyExpressionVm(pedData, skeleton, subAnimations, frameCount, frameDelta,
+                channelData, rotationBoneTags, expression, boneTracksDictOverride, faceTrackAnimValues);
 
             // Now create one glTF channel per unique (nodeIdx, path) pair from the collected data.
             // This ensures no duplicate channels — glTF undefined behavior when multiple channels
@@ -905,6 +955,466 @@ namespace CodeWalker.Export
 
             if (anim.channels.Count > 0)
                 ctx.Animations.Add(anim);
+        }
+
+        /// <summary>
+        /// Execute the Expression VM for each animation frame and apply VM output to
+        /// channel data, overriding animation-applied values for face bones.
+        ///
+        /// This replicates the Expression VM execution from Renderable.UpdateAnim() so
+        /// that glTF exports include the interpretive facial expressions (mouth, eyes,
+        /// jaw, eyebrows) that the VM computes from expression bytecode (.yed files).
+        /// Without this, only direct face animation tracks (T=24/25/26) contribute to
+        /// facial bone channels, and many facial bones remain at bind pose.
+        /// </summary>
+        static void ApplyExpressionVm(
+            PedArmatureData pedData,
+            Skeleton skeleton,
+            List<(Animation Animation, float StartTime, float EndTime)> subAnimations,
+            int frameCount,
+            float frameDelta,
+            Dictionary<(int nodeIdx, string path), List<float>> channelData,
+            HashSet<ushort> rotationBoneTags,
+            Expression expression,
+            Dictionary<ExpressionTrack, ExpressionTrack> boneTracksDictOverride,
+            Dictionary<(ushort BoneId, byte Track), Vector4[]> faceTrackAnimValues)
+        {
+            // The renderer runs the VM per-component (ped.Expressions[i]), but since
+            // all components share the same skeleton and the animation clip contains
+            // all facial tracks in one clip, we need to find the best Expression to
+            // run the VM with. Try per-component expressions first (they have the
+            // actual facial expression data), then fall back to the global expression.
+            Expression vmExpression = null;
+            if (pedData.Ped.Expressions != null)
+            {
+                foreach (var expr in pedData.Ped.Expressions)
+                {
+                    if (expr?.Streams?.data_items != null && expr.Streams.data_items.Length > 0)
+                    {
+                        vmExpression = expr;
+                        break;
+                    }
+                }
+            }
+            if (vmExpression == null && expression?.Streams?.data_items != null && expression.Streams.data_items.Length > 0)
+                vmExpression = expression;
+
+            if (vmExpression == null) return;
+
+            var bonesMap = skeleton?.BonesMap;
+            if (bonesMap == null) return;
+
+            var btDict = boneTracksDictOverride ?? vmExpression.BoneTracksDict;
+
+            // ── Build _faceBoneIds set ──
+            // Identifies which skeleton bone IDs are face bones, so we only apply
+            // VM output to face bones (not body bones). Matches Renderable.cs logic.
+            var faceBoneIds = new HashSet<ushort>();
+
+            // 1) Add skeleton bone IDs from animation face tracks (already remapped)
+            foreach (var ftkv in faceTrackAnimValues.Keys)
+            {
+                // Remap through BoneTracksDict if possible
+                if (btDict != null)
+                {
+                    var lookupKey = new ExpressionTrack() { BoneId = ftkv.BoneId, Track = ftkv.Track, Flags = 0 };
+                    if (btDict.TryGetValue(lookupKey, out var mapped))
+                        faceBoneIds.Add(mapped.BoneId);
+                    else
+                    {
+                        var altKey = new ExpressionTrack() { BoneId = ftkv.BoneId, Track = ftkv.Track, Flags = 0x80 };
+                        if (btDict.TryGetValue(altKey, out var altMapped))
+                            faceBoneIds.Add(altMapped.BoneId);
+                    }
+                }
+            }
+
+            // 2) Add skeleton bone IDs from BoneTracksDict targets with T>=24 source
+            if (btDict != null)
+            {
+                foreach (var kvp in btDict)
+                {
+                    var source = kvp.Key;
+                    var target = kvp.Value;
+                    if (source.Track >= 24 && source.Track <= 26)
+                        faceBoneIds.Add(target.BoneId);
+                }
+            }
+
+            // 3) Add skeleton bone IDs from expression's UnkFlag=False track definitions (T<=2)
+            // These are skeleton bones the expression modifies directly.
+            if (vmExpression.Tracks?.data_items != null)
+            {
+                foreach (var et in vmExpression.Tracks.data_items)
+                {
+                    if (!et.UnkFlag && et.Track <= 2 && bonesMap.ContainsKey(et.BoneId))
+                        faceBoneIds.Add(et.BoneId);
+                }
+            }
+
+            // ── Build exprTrackFormats from Expression.Tracks ──
+            // Store FULL Flags (including 0x80 bit) for correct BoneTracksDict lookups.
+            var exprTrackFormats = new Dictionary<(ushort, byte), byte>();
+            if (vmExpression.Tracks?.data_items != null)
+            {
+                foreach (var et in vmExpression.Tracks.data_items)
+                {
+                    var fk = (et.BoneId, et.Track);
+                    if (!exprTrackFormats.ContainsKey(fk))
+                        exprTrackFormats[fk] = et.Flags;
+                }
+            }
+
+            // ── Initialize VM ──
+            var vm = new ExpressionVm();
+            vm.Weight = 1.0f;
+            vm.Init(vmExpression, 0, 0, 1f / 30f);
+
+            // ── Pre-compute body bone animation values for seeding ──
+            // The VM needs body bone transforms as INPUT (for lookAt etc.).
+            // We compute these per-frame from the existing channelData.
+            // For body bones NOT in faceBoneIds, seed their animated values.
+            // For face bones, leave at zero/identity defaults — the VM computes
+            // face deltas from expression parameters, not from current face state.
+
+            // ── Per-frame VM execution ──
+            for (int f = 0; f < frameCount; f++)
+            {
+                float t = f * frameDelta;
+                float deltaTime = (f == 0) ? 1f / 30f : frameDelta;
+
+                // Reset VM for this frame (keeps spring state)
+                vm.ResetForFrame(t, deltaTime);
+
+                // ── Seed VM with body bone transforms ──
+                var seedData = new Dictionary<(ushort BoneId, byte Track), Vector4>();
+
+                if (vmExpression.Tracks?.data_items != null)
+                {
+                    foreach (var exprTrack in vmExpression.Tracks.data_items)
+                    {
+                        // Only seed position/rotation/scale tracks (T=0/1/2)
+                        if (exprTrack.Track > 2 && exprTrack.Track < 24) continue;
+                        // Face animation channels are seeded separately below
+                        if (exprTrack.Track >= 24) continue;
+
+                        // Resolve the skeleton bone for this expression track
+                        ushort lookupBoneId = exprTrack.BoneId;
+                        var lookupKey = new ExpressionTrack() { BoneId = exprTrack.BoneId, Track = exprTrack.Track, Flags = exprTrack.Format };
+                        if (exprTrack.UnkFlag && vmExpression.BoneTracksDict != null && vmExpression.BoneTracksDict.TryGetValue(lookupKey, out var mapped))
+                            lookupBoneId = mapped.BoneId;
+
+                        // Skip face bones — they get zero/identity defaults
+                        if (faceBoneIds.Contains(lookupBoneId))
+                            continue;
+
+                        Bone skelBone = null;
+                        bonesMap.TryGetValue(lookupBoneId, out skelBone);
+                        if (skelBone == null) continue;
+
+                        switch (exprTrack.Track)
+                        {
+                            case 0: // position
+                                var trans = skelBone.Translation;
+                                seedData[(exprTrack.BoneId, exprTrack.Track)] = new Vector4(trans.X, trans.Y, trans.Z, 0);
+                                break;
+                            case 1: // rotation
+                                var rot = skelBone.Rotation;
+                                seedData[(exprTrack.BoneId, exprTrack.Track)] = new Vector4(rot.X, rot.Y, rot.Z, rot.W);
+                                break;
+                            case 2: // scale
+                                var scale = skelBone.Scale;
+                                seedData[(exprTrack.BoneId, exprTrack.Track)] = new Vector4(scale.X, scale.Y, scale.Z, 0);
+                                break;
+                        }
+                    }
+                }
+
+                // ── Seed VM with face animation track values (T=24/25/26) ──
+                foreach (var ftkv in faceTrackAnimValues)
+                {
+                    if (ftkv.Value != null && f < ftkv.Value.Length)
+                        seedData[ftkv.Key] = ftkv.Value[f];
+                }
+
+                // Also seed face tracks referenced in expression's Tracks list but not in animation
+                if (vmExpression.Tracks?.data_items != null)
+                {
+                    foreach (var exprTrack in vmExpression.Tracks.data_items)
+                    {
+                        if (exprTrack.Track < 24) continue;
+                        var faceKey = (exprTrack.BoneId, (byte)exprTrack.Track);
+                        if (!seedData.ContainsKey(faceKey))
+                        {
+                            seedData[faceKey] = (exprTrack.Format == 1)
+                                ? new Vector4(0, 0, 0, 1)
+                                : Vector4.Zero;
+                        }
+                    }
+                }
+
+                vm.SeedTracks(seedData);
+
+                // Execute the VM
+                vm.RunAllStreams(t, deltaTime);
+
+                // ── Apply VM output to channel data ──
+                if (vm.Tracks.Count == 0 || vm.OutputTracks.Count == 0) continue;
+
+                // Pre-scan: build set of bones with VALID VM rotation output
+                var bonesWithValidRotation = new HashSet<ushort>();
+                foreach (var preKey in vm.OutputTracks)
+                {
+                    var (preBoneId, preTrack, preComp) = preKey;
+                    if (preComp != 0 || preTrack != 1) continue;
+
+                    Vector4 preVal;
+                    if (!vm.Tracks.TryGetValue(preKey, out preVal)) continue;
+
+                    var preLenSq = preVal.X * preVal.X + preVal.Y * preVal.Y + preVal.Z * preVal.Z + preVal.W * preVal.W;
+                    if (preLenSq >= 0.0001f && Math.Abs(preLenSq - 1.0f) <= 0.5f)
+                    {
+                        ushort preSkelId = preBoneId;
+                        byte preFormat;
+                        if (exprTrackFormats.TryGetValue((preBoneId, (byte)preTrack), out preFormat))
+                        {
+                            var preLookup = new ExpressionTrack() { BoneId = preBoneId, Track = (byte)preTrack, Flags = (byte)(preFormat & 0x7F) };
+                            if (vmExpression.BoneTracksDict != null && vmExpression.BoneTracksDict.TryGetValue(preLookup, out var preMapped))
+                                preSkelId = preMapped.BoneId;
+                        }
+                        bonesWithValidRotation.Add(preSkelId);
+                    }
+                }
+
+                // TWO-PASS APPLICATION: Rotations first, then Positions
+                // This matches the renderer: rotations must be applied first so that
+                // position offsets are rotated by the correct animated rotation.
+
+                // PASS 1: Apply rotations (T=1)
+                foreach (var outKey in vm.OutputTracks)
+                {
+                    var (exprBoneId, trackType, compIdx) = outKey;
+                    if (compIdx != 0 || trackType != 1) continue;
+
+                    Vector4 val;
+                    if (!vm.Tracks.TryGetValue(outKey, out val)) continue;
+
+                    ushort skelBoneId = exprBoneId;
+                    bool didRemap = false;
+                    byte format = 0;
+
+                    if (exprTrackFormats.TryGetValue((exprBoneId, trackType), out format))
+                    {
+                        var lookup = new ExpressionTrack() { BoneId = exprBoneId, Track = trackType, Flags = (byte)(format & 0x7F) };
+                        if (vmExpression.BoneTracksDict != null && vmExpression.BoneTracksDict.TryGetValue(lookup, out var mapped))
+                        {
+                            skelBoneId = mapped.BoneId;
+                            didRemap = true;
+                        }
+                    }
+                    else { continue; }
+
+                    if (!didRemap && !faceBoneIds.Contains(skelBoneId))
+                        continue;
+
+                    if (!pedData.BoneTagToNode.TryGetValue(skelBoneId, out int nodeIdx)) continue;
+
+                    Bone targetBone = null;
+                    bonesMap.TryGetValue(skelBoneId, out targetBone);
+                    if (targetBone == null) continue;
+
+                    var vmQuat = new Quaternion(val.X, val.Y, val.Z, val.W);
+                    var lenSq = vmQuat.LengthSquared();
+                    if (lenSq < 0.0001f || Math.Abs(lenSq - 1.0f) > 0.5f) continue;
+
+                    vmQuat = Quaternion.Normalize(vmQuat);
+                    if (vmQuat.W < 0) vmQuat = new Quaternion(-vmQuat.X, -vmQuat.Y, -vmQuat.Z, -vmQuat.W);
+
+                    // Scale VM rotation to match animation loop magnitude
+                    bool isEyeBone = !string.IsNullOrEmpty(targetBone.Name) &&
+                        targetBone.Name.IndexOf("Eye", StringComparison.OrdinalIgnoreCase) >= 0;
+                    float rotScale = isEyeBone ? VmRotScaleEye : VmRotScaleFace;
+                    float vmAngle = 2.0f * (float)Math.Acos(Math.Min(1.0f, Math.Abs(vmQuat.W)));
+                    if (vmAngle > 0.001f)
+                    {
+                        float scaledAngle = vmAngle * rotScale;
+                        float sinHalf = (float)Math.Sin(scaledAngle / 2.0f);
+                        float cosHalf = (float)Math.Cos(scaledAngle / 2.0f);
+                        float axisScale = (vmAngle > 0.0001f) ? sinHalf / (float)Math.Sin(vmAngle / 2.0f) : 1.0f;
+                        vmQuat = new Quaternion(
+                            vmQuat.X * axisScale,
+                            vmQuat.Y * axisScale,
+                            vmQuat.Z * axisScale,
+                            cosHalf * Math.Sign(vmQuat.W));
+                        vmQuat = Quaternion.Normalize(vmQuat);
+                    }
+
+                    // Apply as delta from bind pose: bind rotation * VM delta quaternion
+                    var animRot = Quaternion.Normalize(targetBone.Rotation * vmQuat);
+                    // Convert to glTF coordinates and write into channel data
+                    if (!channelData.ContainsKey((nodeIdx, "rotation")))
+                        channelData[(nodeIdx, "rotation")] = new List<float>(frameCount * 4);
+
+                    var rotList = channelData[(nodeIdx, "rotation")];
+                    // Ensure the list has enough space (may have been created by another bone track)
+                    int targetOffset = f * 4;
+                    if (rotList.Count < (f + 1) * 4)
+                    {
+                        // Pad with bind-pose rotation
+                        while (rotList.Count < targetOffset)
+                        {
+                            rotList.Add(targetBone.Rotation.X);
+                            rotList.Add(targetBone.Rotation.Z);
+                            rotList.Add(-targetBone.Rotation.Y);
+                            rotList.Add(targetBone.Rotation.W);
+                        }
+                        rotList.Add(animRot.X); rotList.Add(animRot.Z); rotList.Add(-animRot.Y); rotList.Add(animRot.W);
+                    }
+                    else
+                    {
+                        // Override existing frame data
+                        rotList[targetOffset] = animRot.X;
+                        rotList[targetOffset + 1] = animRot.Z;
+                        rotList[targetOffset + 2] = -animRot.Y;
+                        rotList[targetOffset + 3] = animRot.W;
+                    }
+                    rotationBoneTags.Add(skelBoneId);
+                }
+
+                // PASS 2: Apply positions (T=0) using updated AnimRotation
+                foreach (var outKey in vm.OutputTracks)
+                {
+                    var (exprBoneId, trackType, compIdx) = outKey;
+                    if (compIdx != 0 || trackType != 0) continue;
+
+                    Vector4 val;
+                    if (!vm.Tracks.TryGetValue(outKey, out val)) continue;
+
+                    ushort skelBoneId = exprBoneId;
+                    bool didRemap = false;
+                    byte format = 0;
+
+                    if (exprTrackFormats.TryGetValue((exprBoneId, trackType), out format))
+                    {
+                        var lookup = new ExpressionTrack() { BoneId = exprBoneId, Track = trackType, Flags = (byte)(format & 0x7F) };
+                        if (vmExpression.BoneTracksDict != null && vmExpression.BoneTracksDict.TryGetValue(lookup, out var mapped))
+                        {
+                            skelBoneId = mapped.BoneId;
+                            didRemap = true;
+                        }
+                    }
+                    else { continue; }
+
+                    if (!didRemap && !faceBoneIds.Contains(skelBoneId)) continue;
+
+                    // Skip position for bones with invalid rotation (parameter channels)
+                    if (!bonesWithValidRotation.Contains(skelBoneId)) continue;
+
+                    if (!pedData.BoneTagToNode.TryGetValue(skelBoneId, out int nodeIdx)) continue;
+
+                    Bone targetBone = null;
+                    bonesMap.TryGetValue(skelBoneId, out targetBone);
+                    if (targetBone == null) continue;
+
+                    var posOffset = new Vector3(val.X, val.Y, val.Z);
+                    posOffset *= VmPosScale;
+                    if (posOffset.Length() > VmPosMaxOffset) continue;
+
+                    // Use the VM's computed rotation for this bone at this frame.
+                    // If the VM wrote a rotation for this bone, we already applied it in Pass 1,
+                    // so compute the final rotation now. Otherwise use bind rotation.
+                    Quaternion animRotForPos = targetBone.Rotation;
+                    var rotChannelKey = (nodeIdx, "rotation");
+                    if (channelData.ContainsKey(rotChannelKey))
+                    {
+                        var rotList = channelData[rotChannelKey];
+                        int rotOffset = f * 4;
+                        if (rotList.Count >= rotOffset + 4)
+                        {
+                            // Use the VM-computed rotation (already in glTF coordinates)
+                            // Convert back to GTA LH for position calculation: glTF(RH) → GTA(LH)
+                            var rx = rotList[rotOffset];
+                            var ry = rotList[rotOffset + 2]; // -GTA_Y → glTF_Z, so GTA_Y = -glTF_Z
+                            var rz = rotList[rotOffset + 1]; // GTA_Z → glTF_Y
+                            var rw = rotList[rotOffset + 3];
+                            animRotForPos = new Quaternion(rx, -rz, -ry, rw);
+                        }
+                    }
+
+                    var animTrans = targetBone.Translation + animRotForPos.Multiply(posOffset);
+
+                    if (!channelData.ContainsKey((nodeIdx, "translation")))
+                        channelData[(nodeIdx, "translation")] = new List<float>(frameCount * 3);
+
+                    var transList = channelData[(nodeIdx, "translation")];
+                    int transOffset = f * 3;
+                    if (transList.Count < (f + 1) * 3)
+                    {
+                        while (transList.Count < transOffset)
+                        {
+                            transList.Add(targetBone.Translation.X);
+                            transList.Add(targetBone.Translation.Z);
+                            transList.Add(-targetBone.Translation.Y);
+                        }
+                        transList.Add(animTrans.X); transList.Add(animTrans.Z); transList.Add(-animTrans.Y);
+                    }
+                    else
+                    {
+                        transList[transOffset] = animTrans.X;
+                        transList[transOffset + 1] = animTrans.Z;
+                        transList[transOffset + 2] = -animTrans.Y;
+                    }
+                }
+            }
+
+            // ── Post-loop: ensure all VM-created channels have frameCount entries ──
+            // When the VM creates a new channel for a bone that had no animation tracks,
+            // and the VM doesn't produce output for every frame, the channel list will be
+            // shorter than frameCount * 4 (rotation) or frameCount * 3 (translation).
+            // Fill remaining frames with bind-pose values so the glTF accessor has the
+            // correct number of elements.
+            var channelsToFill = new List<(int nodeIdx, string path)>();
+            foreach (var kvp in channelData)
+            {
+                int expectedCount = kvp.Key.path == "rotation" ? frameCount * 4 : frameCount * 3;
+                if (kvp.Value.Count < expectedCount)
+                    channelsToFill.Add(kvp.Key);
+            }
+            foreach (var key in channelsToFill)
+            {
+                var list = channelData[key];
+                int expectedCount = key.path == "rotation" ? frameCount * 4 : frameCount * 3;
+                // Find the bone for this node to get bind-pose values
+                ushort boneTag = 0;
+                foreach (var btk in pedData.BoneTagToNode)
+                {
+                    if (btk.Value == key.nodeIdx) { boneTag = btk.Key; break; }
+                }
+                Bone fillBone = null;
+                bonesMap.TryGetValue(boneTag, out fillBone);
+
+                if (key.path == "rotation")
+                {
+                    float bx = fillBone?.Rotation.X ?? 0f;
+                    float by = fillBone?.Rotation.Z ?? 0f;  // glTF Y = GTA Z
+                    float bz = -(fillBone?.Rotation.Y ?? 0f); // glTF Z = -GTA Y
+                    float bw = fillBone?.Rotation.W ?? 1f;
+                    while (list.Count < expectedCount)
+                    {
+                        list.Add(bx); list.Add(by); list.Add(bz); list.Add(bw);
+                    }
+                }
+                else if (key.path == "translation")
+                {
+                    float bx = fillBone?.Translation.X ?? 0f;
+                    float by = fillBone?.Translation.Z ?? 0f;
+                    float bz = -(fillBone?.Translation.Y ?? 0f);
+                    while (list.Count < expectedCount)
+                    {
+                        list.Add(bx); list.Add(by); list.Add(bz);
+                    }
+                }
+            }
         }
 
         #endregion
