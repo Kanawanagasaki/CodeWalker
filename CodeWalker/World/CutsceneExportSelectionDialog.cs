@@ -302,8 +302,11 @@ namespace CodeWalker.World
 
         private void ObjectsCheckedListBox_ItemCheck(object sender, ItemCheckEventArgs e)
         {
-            // Use BeginInvoke to defer the visibility update until after the check state changes
-            BeginInvoke((Action)(() => UpdatePedOverrideVisibility()));
+            // Use BeginInvoke to defer the visibility update until after the check state changes.
+            // Guard with IsHandleCreated because this event fires during PopulateObjects()
+            // in the constructor, before the native window handle exists.
+            if (IsHandleCreated)
+                BeginInvoke((Action)(() => UpdatePedOverrideVisibility()));
         }
 
         /// <summary>
