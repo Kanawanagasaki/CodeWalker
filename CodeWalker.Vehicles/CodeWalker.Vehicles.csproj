@@ -1,17 +1,17 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net48</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>CWVehicles.ico</ApplicationIcon>
     <Copyright>dexyfex</Copyright>
     <Company>dexyfex software</Company>
     <Authors>dexyfex</Authors>
     <AssemblyName>CodeWalker Vehicle Viewer</AssemblyName>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
     <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
 

@@ -790,7 +790,8 @@ namespace CodeWalker.GameFiles
     public enum AwcCodecType
     {
         PCM = 0,
-        ADPCM = 4
+        ADPCM = 4,
+        Vorbis = 7
     }
 
     [TC(typeof(EXP))] public class AwcStreamInfo

@@ -246,13 +246,18 @@ namespace CodeWalker.World
 
         private void PlayAudio(float playTime = 0.0f)
         {
+            System.Diagnostics.Debug.WriteLine($"[CW AUDIO] CutsceneForm.PlayAudio(playTime={playTime}) called, EnableAudio={EnableAudio}, Cutscene={(Cutscene == null ? "null" : "set")}, SoundPlayer={(Cutscene?.SoundPlayer == null ? "null" : "set")}, SoundStartOffset={Cutscene?.SoundStartOffset}, Volume={Volume}");
             StopAudio();
-            if (!EnableAudio) return;
+            if (!EnableAudio) { System.Diagnostics.Debug.WriteLine("[CW AUDIO] PlayAudio: EnableAudio=false, returning"); return; }
             var sp = Cutscene?.SoundPlayer;
             if (sp != null)
             {
                 sp.SetVolume(Volume);
                 sp.Play(Cutscene.SoundStartOffset + playTime);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("[CW AUDIO] PlayAudio: SoundPlayer is null, nothing to play");
             }
         }
         private void StopAudio()

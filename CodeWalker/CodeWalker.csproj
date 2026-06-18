@@ -1,8 +1,8 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net48</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <UseWPF>true</UseWPF>
     <GenerateResourceUsePreserializedResources>true</GenerateResourceUsePreserializedResources>
@@ -10,14 +10,14 @@
     <Copyright>dexyfex</Copyright>
     <Company>dexyfex software</Company>
     <Authors>dexyfex</Authors>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
     <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="DockPanelSuite.ThemeVS2015" Version="3.0.6" />
+    <PackageReference Include="DockPanelSuite.ThemeVS2015" Version="3.1.1" />
     <PackageReference Include="FCTB" Version="2.16.24" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="SharpDX" Version="4.2.0" />
@@ -28,15 +28,12 @@
     <PackageReference Include="SharpDX.XAudio2" Version="4.2.0" />
     <PackageReference Include="SharpDX.XInput" Version="4.2.0" />
     <PackageReference Include="System.Resources.Extensions" Version="10.0.9" />
+    <PackageReference Include="WinForms.DataVisualization" Version="1.10.2" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\CodeWalker.Core\CodeWalker.Core.csproj" />
     <ProjectReference Include="..\CodeWalker.WinForms\CodeWalker.WinForms.csproj" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Include="System.Windows.Forms.DataVisualization" />
   </ItemGroup>
 
   <ItemGroup>
