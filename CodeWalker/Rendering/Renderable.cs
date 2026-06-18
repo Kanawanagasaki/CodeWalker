@@ -11,6 +11,7 @@ using CodeWalker.World;
 using SharpDX.Direct3D;
 using SharpDX;
 using System.Diagnostics;
+using Color = SharpDX.Color;
 
 namespace CodeWalker.Rendering
 {

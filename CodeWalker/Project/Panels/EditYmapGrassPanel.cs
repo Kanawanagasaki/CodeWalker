@@ -5,6 +5,7 @@ using CodeWalker.GameFiles;
 using CodeWalker.Utils;
 using CodeWalker.World;
 using SharpDX;
+using Color = SharpDX.Color;
 
 // TODO
 // - COMPLETED -- Optimization feature.

@@ -12,6 +12,7 @@ using CodeWalker.GameFiles;
 using System.IO;
 using SharpDX.DXGI;
 using CodeWalker.World;
+using Color = SharpDX.Color;
 
 namespace CodeWalker.Rendering
 {

@@ -8,6 +8,7 @@ using CodeWalker.World;
 using SharpDX.Direct3D11;
 using System.IO;
 using SharpDX;
+using Color = SharpDX.Color;
 
 namespace CodeWalker.Rendering
 {

@@ -12,6 +12,7 @@ using Device = SharpDX.Direct3D11.Device;
 using Buffer = SharpDX.Direct3D11.Buffer;
 using MapFlags = SharpDX.Direct3D11.MapFlags;
 using CodeWalker.World;
+using Color = SharpDX.Color;
 
 namespace CodeWalker.Rendering
 {

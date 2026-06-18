@@ -577,19 +577,45 @@ namespace CodeWalker.World
 
                     if (sfd.ShowDialog(this) != DialogResult.OK) return;
 
-                    try
+                    using (var exportLog = GltfExportLogger.Start())
                     {
-                        Cursor = Cursors.WaitCursor;
-                        CutsceneGltfExporter.Export(Cutscene, selectedObjects, sfd.FileName);
-                        Cursor = Cursors.Default;
-                        MessageBox.Show("Export completed successfully!\n\nFile: " + sfd.FileName,
-                            "Export Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    }
-                    catch (Exception ex)
-                    {
-                        Cursor = Cursors.Default;
-                        MessageBox.Show("Export failed:\n\n" + ex.Message + "\n\n" + ex.StackTrace,
-                            "Export Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        exportLog.Log($"CodeWalker cutscene glTF export");
+                        exportLog.Field("Started at", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"));
+                        exportLog.Field("Output file", sfd.FileName);
+                        exportLog.Field("Log file", exportLog.LogFilePath);
+                        exportLog.Field("Cutscene name",
+                            Cutscene?.CutFile?.FileEntry?.GetShortName() ?? "<unknown>");
+                        exportLog.Field("Selected object count", selectedObjects.Count());
+                        if (!string.IsNullOrEmpty(overrideName))
+                        {
+                            exportLog.Field("Ped model override", overrideName);
+                            exportLog.Field("Override target ped",
+                                overrideTarget?.Ped?.Name ?? overrideTarget?.ObjectID.ToString() ?? "<none>");
+                        }
+                        else
+                        {
+                            exportLog.Field("Ped model override", "<none>");
+                        }
+                        exportLog.Blank();
+
+                        try
+                        {
+                            Cursor = Cursors.WaitCursor;
+                            CutsceneGltfExporter.Export(Cutscene, selectedObjects, sfd.FileName, exportLog);
+                            Cursor = Cursors.Default;
+                            MessageBox.Show(
+                                "Export completed successfully!\n\nFile: " + sfd.FileName +
+                                "\n\nDiagnostic log:\n" + exportLog.LogFilePath,
+                                "Export Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        catch (Exception ex)
+                        {
+                            Cursor = Cursors.Default;
+                            exportLog.LogException("CutsceneGltfExporter.Export", ex);
+                            MessageBox.Show("Export failed:\n\n" + ex.Message + "\n\n" + ex.StackTrace +
+                                "\n\nDiagnostic log:\n" + exportLog.LogFilePath,
+                                "Export Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
                     }
                 }
             }

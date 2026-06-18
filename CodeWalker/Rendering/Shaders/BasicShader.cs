@@ -12,6 +12,7 @@ using MapFlags = SharpDX.Direct3D11.MapFlags;
 using SharpDX;
 using CodeWalker.GameFiles;
 using CodeWalker.World;
+using Color = SharpDX.Color;
 
 namespace CodeWalker.Rendering
 {

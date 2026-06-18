@@ -182,7 +182,7 @@ namespace CodeWalker.Export
             public Dictionary<ushort, int> BoneTagToNode = new Dictionary<ushort, int>();
             public int RootNodeIndex = -1;
             public int PedRootNodeIndex = -1;
-            public Dictionary<MetaHash, int> TextureToGltfIndex = new Dictionary<MetaHash, int>();
+            public Dictionary<long, int> TextureToGltfIndex = new Dictionary<long, int>();
             public Dictionary<int, List<int>> NodeChildren = new Dictionary<int, List<int>>();
             public List<int> MeshNodeIndices = new List<int>();
 
@@ -458,6 +458,38 @@ namespace CodeWalker.Export
             var skeleton = ped.Skeleton;
             var bones = skeleton?.Bones?.Items;
 
+            // ── Mirror Renderer.RenderPedComponent's skeleton transplant ──
+            // The GTA V renderer (Renderer.cs:3536-3558) does a "skeleton transplant"
+            // for every ped component before rendering:
+            //   1. If drawable.Skeleton == null → assign ped.Skeleton (null-fallback)
+            //   2. If drawable.Skeleton != ped.Skeleton → replace the drawable's bones
+            //      with the ped's bones (matched by Tag, placed at the drawable's array
+            //      positions). This makes the geometry's BoneIds — which index into the
+            //      drawable's skeleton — resolve to the correct ped bones.
+            //
+            // Without this transplant, the exporter's compBoneToPedBone remap (built
+            // from the drawable's ORIGINAL skeleton) maps drawable indices to ped
+            // indices correctly ONLY when the drawable's skeleton hasn't been mutated
+            // yet. But if the renderer has already run (e.g., the user viewed the
+            // cutscene before exporting), the drawable's skeleton bones have already
+            // been replaced with ped bones, and the Tag-based remap may produce
+            // incorrect results because the bone array positions no longer match the
+            // original drawable skeleton ordering.
+            //
+            // By doing the transplant here (idempotent — safe to call even if the
+            // renderer already did it), we guarantee the drawable's skeleton is in
+            // the exact state the renderer expects, and the compBoneToPedBone remap
+            // (built AFTER the transplant) correctly maps drawable indices → ped indices.
+            if (skeleton?.Bones?.Items != null)
+            {
+                for (int compIdx = 0; compIdx < 12; compIdx++)
+                {
+                    var drawable = ped.Drawables[compIdx];
+                    if (drawable == null) continue;
+                    PrepareComponentSkeleton(drawable, skeleton);
+                }
+            }
+
             // Pre-build Bone->array-index lookup for cloth bone remapping
             Dictionary<Bone, int> boneToArrayIndex = null;
             if (bones != null)
@@ -482,13 +514,27 @@ namespace CodeWalker.Export
                     pedTagToArrayIndex[bones[i].Tag] = i;
             }
 
+            string[] compNamesLog = { "Head", "Berd", "Hair", "Uppr", "Lowr", "Hand", "Feet", "Teef", "Accs", "Task", "Decl", "Jbib" };
+            var log = GltfExportLogger.Current;
+            log?.BeginScope($"BuildPedMeshes: {ped.Name ?? "<unnamed>"}");
+
             for (int compIdx = 0; compIdx < 12; compIdx++)
             {
                 var drawable = ped.Drawables[compIdx];
-                if (drawable == null) continue;
+                if (drawable == null)
+                {
+                    log?.Log($"  [{compIdx}] {compNamesLog[compIdx]}: drawable=NULL (skipped)");
+                    continue;
+                }
                 var texture = ped.Textures[compIdx];
                 var models = drawable.DrawableModels?.High;
-                if (models == null) continue;
+                if (models == null)
+                {
+                    log?.Log($"  [{compIdx}] {compNamesLog[compIdx]}: drawable='{drawable.Name}' but DrawableModels.High=NULL (skipped)");
+                    continue;
+                }
+                log?.Log($"  [{compIdx}] {compNamesLog[compIdx]}: drawable='{drawable.Name}'  texture='{(texture?.Name ?? "<null>")}'  models={models.Length}  " +
+                         $"compSkeleton={(drawable.Skeleton != null ? (ReferenceEquals(drawable.Skeleton, skeleton) ? "shared (null-fallback — BoneIds used as ped skeleton indices, no remap)" : "own (will Tag-remap bone indices)") : "<none>")}");
 
                 // Detect cloth components and build cloth vertex data.
                 // Regular cloth drawable vertices use their original skeletal bone weights,
@@ -568,9 +614,13 @@ namespace CodeWalker.Export
                 var diffuseTex = FindDiffuseTexture(drawable, texture);
                 int? materialIdx = null;
                 if (diffuseTex != null)
+                {
                     materialIdx = ExportTexture(ctx, diffuseTex, namePrefix + compNames[compIdx], drawable);
+                    log?.Log($"           diffuse texture: '{diffuseTex.Name ?? "<unnamed>"}' (embedded in material #{materialIdx})");
+                }
                 else
                 {
+                    log?.Log($"           !! diffuse texture NOT FOUND (componentDrawable='{drawable.Name}', pedTexture='{texture?.Name ?? "<null>"}') — using blank material (THIS IS A COMMON SOURCE OF WRONG-TEXTURE EXPORTS)");
                     var mat = new GltfMaterial
                     {
                         name = namePrefix + compNames[compIdx] + "_Material",
@@ -581,6 +631,7 @@ namespace CodeWalker.Export
                 }
 
                 var mesh = new GltfMesh { name = namePrefix + compNames[compIdx] };
+                int geomTotal = 0, geomSkipped = 0, primBuilt = 0;
                 for (int mi = 0; mi < models.Length; mi++)
                 {
                     var model = models[mi];
@@ -589,20 +640,32 @@ namespace CodeWalker.Export
                     {
                         var geom = model.Geometries[gi];
                         if (geom == null) continue;
+                        geomTotal++;
 
                         // Skip hair control mesh geometries (orderNumber > 0 on hair shaders).
                         // In GTA V, these geometries drive GPU tessellation and should not be
                         // rendered directly. The renderer skips them via disableRendering flag.
-                        if (ShouldSkipGeometry(geom)) continue;
+                        if (ShouldSkipGeometry(geom))
+                        {
+                            geomSkipped++;
+                            log?.Log($"           skipping geometry #{gi} (ShouldSkipGeometry=true — typically hair control mesh)");
+                            continue;
+                        }
 
                         var prim = BuildPrimitive(ctx, geom, model, ped.Skeleton, clothVertexData, compBoneToPedBone);
                         if (prim != null)
                         {
                             if (materialIdx.HasValue) prim.material = materialIdx.Value;
                             mesh.primitives.Add(prim);
+                            primBuilt++;
+                        }
+                        else
+                        {
+                            log?.Log($"           geometry #{gi} produced NULL primitive (BuildPrimitive returned null)");
                         }
                     }
                 }
+                log?.Log($"           geometries: total={geomTotal}  skipped={geomSkipped}  primitivesBuilt={primBuilt}");
 
                 if (mesh.primitives.Count > 0)
                 {
@@ -621,8 +684,93 @@ namespace CodeWalker.Export
                     ctx.MeshNodeIndices.Add(meshNodeIdx);
                     ctx.NodeChildren[meshNodeIdx] = new List<int>();
                     ctx.NodeChildren[pedData.PedRootNodeIndex].Add(meshNodeIdx);
+                    log?.Log($"           -> mesh added: '{mesh.name}' primitives={mesh.primitives.Count} materialIdx={materialIdx}");
+                }
+                else
+                {
+                    log?.Log($"           -> NO mesh added (all primitives were skipped — geometry produced nothing exportable)");
                 }
             }
+
+            log?.EndScope();
+        }
+
+        /// <summary>
+        /// Mirror Renderer.RenderPedComponent's skeleton transplant logic.
+        ///
+        /// This is the EXACT same logic the GTA V renderer runs on every frame for
+        /// each ped component (Renderer.cs:3536-3558). We run it once before building
+        /// meshes so the drawable's skeleton is in the state the renderer expects:
+        ///
+        /// 1. If drawable.Skeleton == null:
+        ///    Assign ped.Skeleton. The drawable was authored without an embedded
+        ///    skeleton, so its geometry's BoneIds are intended to index directly
+        ///    into the host ped's skeleton. (Renderer null-fallback.)
+        ///
+        /// 2. If drawable.Skeleton != ped.Skeleton:
+        ///    Replace the drawable's bones with the ped's bones, matched by Tag,
+        ///    placed at the DRAWABLE's array positions. After this transplant,
+        ///    drawable.Skeleton.Bones.Items[drawableIdx] is the ped bone whose Tag
+        ///    matches the original drawable bone at that index. The geometry's
+        ///    BoneIds (which index into the drawable's skeleton) now resolve to
+        ///    the correct ped bones. (Renderer Tag-based transplant.)
+        ///
+        /// 3. If drawable.Skeleton == ped.Skeleton (already transplanted or
+        ///    null-fallback already applied): no-op.
+        ///
+        /// This method is IDEMPOTENT — safe to call even if the renderer has
+        /// already done the transplant. The "if (srcbone == dstbone) break" guard
+        /// from the renderer is replicated: once a ped bone reference is found at
+        /// the expected position, we know the transplant is already done and stop.
+        /// </summary>
+        static void PrepareComponentSkeleton(DrawableBase drawable, Skeleton pedSkeleton)
+        {
+            if (drawable == null || pedSkeleton?.Bones?.Items == null) return;
+
+            if (drawable.Skeleton == null)
+            {
+                // Case 1: null-fallback — drawable has no skeleton, use ped's.
+                drawable.Skeleton = pedSkeleton;
+                return;
+            }
+
+            if (ReferenceEquals(drawable.Skeleton, pedSkeleton))
+            {
+                // Case 3: already assigned (null-fallback applied previously).
+                return;
+            }
+
+            // Case 2: Tag-based transplant — replace drawable's bones with ped's bones.
+            var dskel = drawable.Skeleton;
+            var dskelBones = dskel.Bones?.Items;
+            var dskelBonesMap = dskel.BonesMap;
+            if (dskelBones == null || dskelBonesMap == null) return;
+
+            var pedBones = pedSkeleton.Bones.Items;
+            for (int b = 0; b < pedBones.Length; b++)
+            {
+                var srcbone = pedBones[b];
+                if (srcbone == null) continue;
+
+                // Find the bone in the drawable's skeleton with the same Tag
+                if (!dskelBonesMap.TryGetValue(srcbone.Tag, out var dstbone) || dstbone == null)
+                    continue;
+
+                // If the drawable's bone is already the ped's bone (by reference),
+                // the transplant was already done — stop early.
+                if (ReferenceEquals(srcbone, dstbone)) break;
+
+                // Replace the drawable's bone at its array position with the ped's bone.
+                // dstbone.Index is the array position in the drawable's skeleton.
+                if (dstbone.Index >= 0 && dstbone.Index < dskelBones.Length)
+                    dskelBones[dstbone.Index] = srcbone;
+                // Update the BonesMap so the Tag now points to the ped's bone.
+                dskelBonesMap[srcbone.Tag] = srcbone;
+            }
+
+            // Also copy the sorted bones array (the renderer does this; it's used for
+            // hierarchical bone transform updates).
+            dskel.BonesSorted = pedSkeleton.BonesSorted;
         }
 
         #endregion
@@ -647,9 +795,30 @@ namespace CodeWalker.Export
         /// matching the renderer's behavior of using ped.Expressions[i] per component.</param>
         public static void BuildPedAnimation(ExportContext ctx, PedArmatureData pedData, ClipMapEntry animClip, string animName, Expression expression = null, Dictionary<ExpressionTrack, ExpressionTrack> boneTracksDictOverride = null)
         {
-            if (animClip?.Clip == null) return;
+            var log = GltfExportLogger.Current;
+            log?.BeginScope($"BuildPedAnimation: {animName}");
+
+            if (animClip?.Clip == null)
+            {
+                log?.Log("  !! animClip or animClip.Clip is NULL — animation will be skipped (T-pose)");
+                log?.EndScope();
+                return;
+            }
             var skeleton = pedData.Ped.Skeleton;
-            if (skeleton == null) return;
+            if (skeleton == null)
+            {
+                log?.Log("  !! ped.Skeleton is NULL — animation will be skipped (T-pose)");
+                log?.EndScope();
+                return;
+            }
+
+            log?.Field("  Clip type", animClip.Clip.GetType().Name);
+            log?.Field("  Clip hash", animClip.Hash);
+            log?.Field("  Ped.Name", pedData.Ped.Name ?? "<null>");
+            log?.Field("  Skeleton bone count", skeleton.Bones?.Items?.Length ?? 0);
+            log?.Field("  BoneTagToNode entries", pedData.BoneTagToNode.Count);
+            log?.Field("  Expression (global)", expression != null ? "OK" : "<null>");
+            log?.Field("  BoneTracksDictOverride entries", boneTracksDictOverride?.Count ?? 0);
 
             var anim = new GltfAnimation { name = animName + "_Anim" };
 
@@ -671,7 +840,14 @@ namespace CodeWalker.Export
                 }
             }
 
-            if (subAnimations.Count == 0) return;
+            log?.Field("  Sub-animations resolved", subAnimations.Count);
+
+            if (subAnimations.Count == 0)
+            {
+                log?.Log("  !! no sub-animations resolved — animation will be skipped (T-pose)");
+                log?.EndScope();
+                return;
+            }
 
             // Use the maximum duration across all sub-animations and the clip's own duration.
             float duration = 0f;
@@ -682,12 +858,21 @@ namespace CodeWalker.Export
                 if (sa.Animation?.Duration > 0 && sa.Animation.Duration > duration)
                     duration = sa.Animation.Duration;
             }
-            if (duration <= 0) return;
+            log?.Field("  Computed duration (s)", duration);
+            if (duration <= 0)
+            {
+                log?.Log("  !! duration <= 0 — animation will be skipped (T-pose)");
+                log?.EndScope();
+                return;
+            }
 
             // Use the first sub-animation's frame info for frame count calculation.
             var firstAnim = subAnimations[0].Animation;
             int frameCount = Math.Min(firstAnim.Frames > 0 ? firstAnim.Frames : (int)(duration * 30f), 300);
             float frameDelta = duration / (frameCount - 1);
+            log?.Field("  firstAnim.Frames", firstAnim.Frames);
+            log?.Field("  frameCount (export)", frameCount);
+            log?.Field("  frameDelta", frameDelta);
 
             // Time accessor
             var timeData = new float[frameCount];
@@ -715,16 +900,32 @@ namespace CodeWalker.Export
             // Key: (animBoneId, track) → array of per-frame Vector4 values
             var faceTrackAnimValues = new Dictionary<(ushort BoneId, byte Track), Vector4[]>();
 
+            // Per-track counters for diagnostics — how many tracks were processed,
+            // how many were remapped successfully, how many fell through because the
+            // bone wasn't in the skeleton. A T-pose export typically shows
+            // tracksProcessed=many but tracksResolvedToNode=0 for the body rotation track (T=1).
+            int tracksProcessed = 0, tracksResolvedToNode = 0;
+            var tracksByType = new Dictionary<byte, int>();
+            var tracksUnresolvedByType = new Dictionary<byte, int>();
+            var unresolvedBodyBoneIds = new List<ushort>(); // body bones (T<=2) whose lookup failed
+
             // Process each sub-animation, just like the renderer does.
+            int subIdx = 0;
             foreach (var subAnim in subAnimations)
             {
                 var animData = subAnim.Animation;
                 var boneIds = animData.BoneIds?.data_items;
-                if (boneIds == null) continue;
+                log?.Field($"  Sub-anim[{subIdx}].BoneIds count", boneIds?.Length ?? 0);
+                log?.Field($"  Sub-anim[{subIdx}].StartTime", subAnim.StartTime);
+                log?.Field($"  Sub-anim[{subIdx}].EndTime", subAnim.EndTime);
+                log?.Field($"  Sub-anim[{subIdx}].Animation.Duration", subAnim.Animation?.Duration ?? 0);
+                if (boneIds == null) { subIdx++; continue; }
 
                 for (int bi = 0; bi < boneIds.Length; bi++)
                 {
                     var boneId = boneIds[bi];
+                    tracksProcessed++;
+                    tracksByType[boneId.Track] = tracksByType.TryGetValue(boneId.Track, out var c) ? c + 1 : 1;
 
                     // For facial tracks (24/25/26), remap bone ID through the BoneTracksDict.
                     // This replicates the renderer's behavior in Renderable.cs UpdateAnim()
@@ -755,7 +956,19 @@ namespace CodeWalker.Export
 
                     // For facial tracks, use the remapped bone ID for node lookup
                     ushort lookupBoneId = (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26) ? effectiveBoneId : boneId.BoneId;
-                    if (!pedData.BoneTagToNode.TryGetValue(lookupBoneId, out int nodeIdx)) continue;
+                    if (!pedData.BoneTagToNode.TryGetValue(lookupBoneId, out int nodeIdx))
+                    {
+                        // Bone lookup failed — this track will be silently dropped, contributing to T-pose
+                        // if it's a body rotation track (T=1) for a major bone like spine/thigh/upperarm.
+                        tracksUnresolvedByType[boneId.Track] = tracksUnresolvedByType.TryGetValue(boneId.Track, out var uc) ? uc + 1 : 1;
+                        if (boneId.Track <= 2)
+                        {
+                            unresolvedBodyBoneIds.Add(boneId.BoneId);
+                            log?.Log($"           !! BONE LOOKUP FAILED: track={boneId.Track} boneId=0x{boneId.BoneId:X4}({boneId.BoneId}) — not in ped skeleton (will be dropped, contributing to T-pose)");
+                        }
+                        continue;
+                    }
+                    tracksResolvedToNode++;
 
                     // Look up the bone for facial animation calculations (need bind-pose TRS)
                     Bone bone = null;
@@ -914,6 +1127,7 @@ namespace CodeWalker.Export
                         rotationBoneTags.Add(lookupBoneId);
                     }
                 }
+                subIdx++;
             }
 
             // ── Expression VM execution (AFTER animation track loop) ────────
@@ -953,8 +1167,41 @@ namespace CodeWalker.Export
             // Thigh bone (SKEL_L_Thigh / SKEL_R_Thigh).
             CopyThighRollRotation(ctx, pedData, anim, subAnimations, timeAcc, frameCount, frameDelta, rotationBoneTags);
 
+            // ── Diagnostic summary ───────────────────────────────────────────
+            log?.Field("  Tracks processed", tracksProcessed);
+            log?.Field("  Tracks resolved to a node", tracksResolvedToNode);
+            log?.Field("  Tracks dropped (bone not in skeleton)", tracksProcessed - tracksResolvedToNode);
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var kv in tracksByType.OrderBy(k => k.Key))
+                    sb.Append($"T{kv.Key}={kv.Value} ");
+                log?.Field("  Tracks by type", sb.ToString().Trim());
+
+                var usb = new System.Text.StringBuilder();
+                foreach (var kv in tracksUnresolvedByType.OrderBy(k => k.Key))
+                    usb.Append($"T{kv.Key}={kv.Value} ");
+                log?.Field("  Unresolved tracks by type", usb.Length == 0 ? "<none>" : usb.ToString().Trim());
+            }
+            if (unresolvedBodyBoneIds.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var bid in unresolvedBodyBoneIds.Distinct().OrderBy(x => x))
+                    sb.Append($"0x{bid:X4} ");
+                log?.Field("  Unresolved BODY bone IDs", sb.ToString().Trim());
+            }
+            log?.Field("  Unique (nodeIdx,path) channels produced", channelData.Count);
+            log?.Field("  Face tracks captured for VM seeding", faceTrackAnimValues.Count);
+            log?.Field("  Final anim.channels", anim.channels.Count);
+            log?.Field("  Final anim.samplers", anim.samplers.Count);
+            if (anim.channels.Count == 0)
+                log?.Log("  !! FINAL: animation has 0 channels — exported model will be in T-pose");
+            else if (anim.channels.Count < 5)
+                log?.Log($"  !! WARNING: only {anim.channels.Count} channels produced — very few; body bones may be missing animation (likely T-pose)");
+            log?.Field("  Animation added to ctx.Animations", anim.channels.Count > 0 ? "YES" : "NO");
+
             if (anim.channels.Count > 0)
                 ctx.Animations.Add(anim);
+            log?.EndScope();
         }
 
         /// <summary>
@@ -1917,7 +2164,23 @@ namespace CodeWalker.Export
         public static int ExportTexture(ExportContext ctx, Texture tex, string compName, DrawableBase drawable = null)
         {
             if (tex == null) return -1;
-            if (ctx.TextureToGltfIndex.TryGetValue(tex.NameHash, out int existingIdx))
+
+            // Per-ped texture isolation: the dedup key must include the compName prefix
+            // (which contains the ped name for cutscene exports, e.g., "player_one_Head").
+            // Without this, two peds that both have a texture named "head_diff_000_a_bla"
+            // would share the same glTF material — causing ped #2 to render with ped #1's
+            // textures. The renderer doesn't have this issue because it renders each ped
+            // independently with its own texture bindings.
+            //
+            // The compName prefix already encodes which ped this texture belongs to
+            // (passed as namePrefix + compNames[compIdx] from BuildPedMeshes), so we
+            // use it directly as part of the dedup key.
+            //
+            // IMPORTANT: the key MUST be a long (64-bit) to hold both the compName hash
+            // (upper 32 bits) and the texture NameHash (lower 32 bits). Casting to
+            // MetaHash (uint) would truncate the compName hash, re-introducing the bug.
+            long dedupKey = ((long)(uint)compName.GetHashCode() << 32) | (uint)tex.NameHash;
+            if (ctx.TextureToGltfIndex.TryGetValue(dedupKey, out int existingIdx))
                 return existingIdx;
 
             int imageIdx;
@@ -1973,7 +2236,7 @@ namespace CodeWalker.Export
             var gltfTex = new GltfTexture { source = imageIdx, sampler = samplerIdx };
             int texIdx = ctx.Textures.Count;
             ctx.Textures.Add(gltfTex);
-            ctx.TextureToGltfIndex[tex.NameHash] = texIdx;
+            ctx.TextureToGltfIndex[dedupKey] = texIdx;
 
             var mat = new GltfMaterial
             {
