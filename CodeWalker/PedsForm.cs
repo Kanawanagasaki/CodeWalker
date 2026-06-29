@@ -1781,7 +1781,19 @@ namespace CodeWalker
             using (var sfd = new SaveFileDialog())
             {
                 sfd.Title = "Export Ped as glTF/GLB";
-                sfd.FileName = (SelectedPed.Name ?? "ped") + ".glb";
+
+                // Build a descriptive filename: pedModel_clipDict_clip.glb
+                // Empty/unknown segments are skipped so we don't end up with "ped___idle.glb".
+                // Each segment is sanitized to replace characters that are illegal in Windows
+                // filenames (< > : " / \ | ? *) and the clip-dict "@" separator.
+                var nameParts = new List<string>(3);
+                string pedModel = SelectedPed.InitData?.Name;
+                if (!string.IsNullOrWhiteSpace(pedModel)) nameParts.Add(SanitizeFileNameSegment(pedModel));
+                if (!string.IsNullOrWhiteSpace(ClipDictComboBox.Text)) nameParts.Add(SanitizeFileNameSegment(ClipDictComboBox.Text));
+                if (!string.IsNullOrWhiteSpace(ClipComboBox.Text)) nameParts.Add(SanitizeFileNameSegment(ClipComboBox.Text));
+                if (nameParts.Count == 0) nameParts.Add(SelectedPed.Name ?? "ped");
+                sfd.FileName = string.Join("_", nameParts) + ".glb";
+
                 sfd.Filter = "GLB Binary glTF|*.glb|glTF (embedded)|*.gltf|All files|*.*";
                 sfd.DefaultExt = "glb";
                 sfd.AddExtension = true;
@@ -1886,6 +1898,31 @@ namespace CodeWalker
                         failCount > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
                 }
             }
+        }
+
+
+        /// <summary>
+        /// Replace characters that are illegal in Windows filenames
+        /// (&lt; &gt; : " / \ | ? *) and the GTA clip-dict "@" separator
+        /// with underscores, so the segment can be safely embedded in an export filename.
+        /// </summary>
+        private static string SanitizeFileNameSegment(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            var sb = new System.Text.StringBuilder(s.Length);
+            foreach (char c in s)
+            {
+                if (c == '<' || c == '>' || c == ':' || c == '"' || c == '/' ||
+                    c == '\\' || c == '|' || c == '?' || c == '*' || c == '@')
+                {
+                    sb.Append('_');
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            return sb.ToString();
         }
     }
 }

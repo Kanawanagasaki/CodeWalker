@@ -927,6 +927,26 @@ namespace CodeWalker.Export
             var firstAnim = subAnimations[0].Animation;
             int frameCount = Math.Min(firstAnim.Frames > 0 ? firstAnim.Frames : (int)(duration * 30f), 300);
             float frameDelta = duration / (frameCount - 1);
+
+            // ── DEBUG: animation clip diagnostics ────────────────────────────
+            // Trace the animation clip's raw frame info and per-sub-anim state so we can
+            // tell whether the source data has variation (e.g. for facial-only clips whose
+            // values come out constant in the export).
+            System.Diagnostics.Debug.WriteLine(
+                $"[BuildPedAnimation] animName='{animName}' clipType={animClip.Clip.GetType().Name} " +
+                $"clipHash={animClip.Hash} subAnims={subAnimations.Count} duration={duration} " +
+                $"firstAnim.Frames={firstAnim.Frames} firstAnim.SequenceFrameLimit={firstAnim.SequenceFrameLimit} " +
+                $"firstAnim.Duration={firstAnim.Duration} frameCount={frameCount} frameDelta={frameDelta}");
+            for (int sai = 0; sai < subAnimations.Count; sai++)
+            {
+                var sa2 = subAnimations[sai];
+                System.Diagnostics.Debug.WriteLine(
+                    $"[BuildPedAnimation]   subAnim[{sai}]: StartTime={sa2.StartTime} EndTime={sa2.EndTime} " +
+                    $"Animation.Duration={sa2.Animation?.Duration ?? -1} Frames={sa2.Animation?.Frames ?? 0} " +
+                    $"SeqFrameLimit={sa2.Animation?.SequenceFrameLimit ?? 0} " +
+                    $"BoneIds={sa2.Animation?.BoneIds?.data_items?.Length ?? 0} " +
+                    $"Sequences={sa2.Animation?.Sequences?.data_items?.Length ?? 0}");
+            }
             log?.Field("  firstAnim.Frames", firstAnim.Frames);
             log?.Field("  frameCount (export)", frameCount);
             log?.Field("  frameDelta", frameDelta);
@@ -1097,6 +1117,7 @@ namespace CodeWalker.Export
                         if (bone == null) continue;
                         var vals = new List<float>(frameCount * 3);
                         var faceVals = new Vector4[frameCount];
+                        int dbgCaughtCount = 0;
                         for (int f = 0; f < frameCount; f++)
                         {
                             try
@@ -1109,12 +1130,25 @@ namespace CodeWalker.Export
                                 var animTrans = bone.Translation + bone.Rotation.Multiply(fv);
                                 vals.Add(animTrans.X); vals.Add(animTrans.Z); vals.Add(-animTrans.Y);
                             }
-                            catch
+                            catch (Exception ex)
                             {
+                                dbgCaughtCount++;
                                 faceVals[f] = Vector4.Zero;
                                 vals.Add(bone.Translation.X); vals.Add(bone.Translation.Z); vals.Add(-bone.Translation.Y);
+                                if (f == 0 || f == frameCount - 1)
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"[BuildPedAnimation] T24 boneId=0x{boneId.BoneId:X4} bi={bi} frame={f} EXCEPTION: {ex.GetType().Name}: {ex.Message}");
                             }
                         }
+                        // Trace first/mid/last raw value for this facial track so we can see if the
+                        // source data is actually animated or if we're hitting the catch{} on every frame.
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[BuildPedAnimation] T24 boneId=0x{boneId.BoneId:X4} effBoneId=0x{effectiveBoneId:X4} bi={bi} " +
+                            $"nodeIdx={nodeIdx} boneName='{bone.Name}' frames={frameCount} " +
+                            $"first=({faceVals[0].X},{faceVals[0].Y},{faceVals[0].Z},{faceVals[0].W}) " +
+                            $"mid=({faceVals[frameCount / 2].X},{faceVals[frameCount / 2].Y},{faceVals[frameCount / 2].Z},{faceVals[frameCount / 2].W}) " +
+                            $"last=({faceVals[frameCount - 1].X},{faceVals[frameCount - 1].Y},{faceVals[frameCount - 1].Z},{faceVals[frameCount - 1].W}) " +
+                            $"catchCount={dbgCaughtCount}");
                         faceTrackAnimValues[(boneId.BoneId, (byte)boneId.Track)] = faceVals;
                         // Later track for same node+path overrides earlier (matches renderer: last writer wins)
                         channelData[(nodeIdx, "translation")] = vals;
@@ -1129,6 +1163,7 @@ namespace CodeWalker.Export
                         var vals = new List<float>(frameCount * 4);
                         float mult = -0.314159265f;
                         var faceVals = new Vector4[frameCount];
+                        int dbgCaughtCount = 0;
                         for (int f = 0; f < frameCount; f++)
                         {
                             try
@@ -1143,12 +1178,23 @@ namespace CodeWalker.Export
                                 var animRot = bone.Rotation * q;
                                 vals.Add(animRot.X); vals.Add(animRot.Z); vals.Add(-animRot.Y); vals.Add(animRot.W);
                             }
-                            catch
+                            catch (Exception ex)
                             {
+                                dbgCaughtCount++;
                                 faceVals[f] = Vector4.Zero;
                                 vals.Add(bone.Rotation.X); vals.Add(bone.Rotation.Z); vals.Add(-bone.Rotation.Y); vals.Add(bone.Rotation.W);
+                                if (f == 0 || f == frameCount - 1)
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"[BuildPedAnimation] T25 boneId=0x{boneId.BoneId:X4} bi={bi} frame={f} EXCEPTION: {ex.GetType().Name}: {ex.Message}");
                             }
                         }
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[BuildPedAnimation] T25 boneId=0x{boneId.BoneId:X4} effBoneId=0x{effectiveBoneId:X4} bi={bi} " +
+                            $"nodeIdx={nodeIdx} boneName='{bone.Name}' frames={frameCount} " +
+                            $"first=({faceVals[0].X},{faceVals[0].Y},{faceVals[0].Z},{faceVals[0].W}) " +
+                            $"mid=({faceVals[frameCount / 2].X},{faceVals[frameCount / 2].Y},{faceVals[frameCount / 2].Z},{faceVals[frameCount / 2].W}) " +
+                            $"last=({faceVals[frameCount - 1].X},{faceVals[frameCount - 1].Y},{faceVals[frameCount - 1].Z},{faceVals[frameCount - 1].W}) " +
+                            $"catchCount={dbgCaughtCount}");
                         faceTrackAnimValues[(boneId.BoneId, (byte)boneId.Track)] = faceVals;
                         // Facial rotation overrides body rotation for the same bone (matches renderer)
                         channelData[(nodeIdx, "rotation")] = vals;
@@ -1160,6 +1206,7 @@ namespace CodeWalker.Export
                         if (bone == null) continue;
                         var vals = new List<float>(frameCount * 4);
                         var faceVals = new Vector4[frameCount];
+                        int dbgCaughtCount = 0;
                         for (int f = 0; f < frameCount; f++)
                         {
                             try
@@ -1173,12 +1220,23 @@ namespace CodeWalker.Export
                                 var animRot = bone.Rotation * q;
                                 vals.Add(animRot.X); vals.Add(animRot.Z); vals.Add(-animRot.Y); vals.Add(animRot.W);
                             }
-                            catch
+                            catch (Exception ex)
                             {
+                                dbgCaughtCount++;
                                 faceVals[f] = new Vector4(0, 0, 0, 1);
                                 vals.Add(bone.Rotation.X); vals.Add(bone.Rotation.Z); vals.Add(-bone.Rotation.Y); vals.Add(bone.Rotation.W);
+                                if (f == 0 || f == frameCount - 1)
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"[BuildPedAnimation] T26 boneId=0x{boneId.BoneId:X4} bi={bi} frame={f} EXCEPTION: {ex.GetType().Name}: {ex.Message}");
                             }
                         }
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[BuildPedAnimation] T26 boneId=0x{boneId.BoneId:X4} effBoneId=0x{effectiveBoneId:X4} bi={bi} " +
+                            $"nodeIdx={nodeIdx} boneName='{bone.Name}' frames={frameCount} " +
+                            $"first=({faceVals[0].X},{faceVals[0].Y},{faceVals[0].Z},{faceVals[0].W}) " +
+                            $"mid=({faceVals[frameCount / 2].X},{faceVals[frameCount / 2].Y},{faceVals[frameCount / 2].Z},{faceVals[frameCount / 2].W}) " +
+                            $"last=({faceVals[frameCount - 1].X},{faceVals[frameCount - 1].Y},{faceVals[frameCount - 1].Z},{faceVals[frameCount - 1].W}) " +
+                            $"catchCount={dbgCaughtCount}");
                         faceTrackAnimValues[(boneId.BoneId, (byte)boneId.Track)] = faceVals;
                         channelData[(nodeIdx, "rotation")] = vals;
                         rotationBoneTags.Add(lookupBoneId);
