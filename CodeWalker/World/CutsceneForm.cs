@@ -622,15 +622,34 @@ namespace CodeWalker.World
         }
 
         /// <summary>
-        /// Swap a cutscene ped's visual model (mesh + textures) with a different ped model,
-        /// while preserving the original skeleton and animation. This allows exporting
-        /// a cutscene character with a different appearance — for example, applying
-        /// Michael's cutscene animation to a custom ped model.
+        /// Swap a cutscene ped's visual model (mesh + textures + skeleton) with a different
+        /// ped model, while preserving the cutscene's animation clip. This allows exporting
+        /// a cutscene character with a different appearance — for example, applying Michael's
+        /// cutscene animation to a custom ped model.
         ///
-        /// The override loads the new ped's drawables, textures, and per-component
-        /// expressions from GameFileCache, then copies them into the cutscene ped's
-        /// component slots. The original skeleton, AnimClip, and global Expression
-        /// are preserved so the animation plays correctly on the new model.
+        /// The override loads the new ped's drawables, textures, per-component expressions,
+        /// AND SKELETON from GameFileCache, then copies them into the cutscene ped's slots.
+        /// The original AnimClip is preserved — it works on the new skeleton because GTA V
+        /// animation clips reference bones by Tag (hashed name), not by array index. All
+        /// standard ped skeletons (player_zero/one/two and all NPC peds) share the same
+        /// Tags for the SKEL_* body bones, so body animation plays correctly on any ped
+        /// skeleton. Facial animation is driven by the override's Expression BoneTracksDict,
+        /// which maps to the override model's facial bone Tags — those Tags exist in the
+        /// override's skeleton, so facial animation also plays correctly.
+        ///
+        /// IMPORTANT: The override's skeleton MUST be used (not the original cutscene
+        /// skeleton). The override's drawables' vertex skinning indices and ClothInstance
+        /// bone references are authored against the override's skeleton. If the original
+        /// (typically player) skeleton is preserved, bones get messed up because:
+        ///   - Player skeletons have ~310 bones (extra facial/paraphernalia bones),
+        ///     NPC skeletons have ~270. NPC drawable vertices weighted to NPC-only facial
+        ///     bones would have no matching Tag in the player skeleton and fall back to
+        ///     the root bone, collapsing the face.
+        ///   - ClothInstance.Bones are initialized against the override's skeleton; if the
+        ///     ped skeleton is swapped back to the player skeleton, all cloth bone refs
+        ///     fail to resolve and every cloth vertex collapses to the root bone.
+        /// Using the override's skeleton wholesale eliminates both classes of bug and
+        /// produces a flawless conversion for both player→NPC and NPC→player overrides.
         /// </summary>
         private void ApplyPedModelOverride(CutsceneObject csObj, string overridePedName)
         {
@@ -638,29 +657,38 @@ namespace CodeWalker.World
 
             try
             {
-                // Load the override ped model
+                // Load the override ped model.
+                // overridePed.Skeleton is a clone of the override's YFT skeleton, so it's
+                // safe to mutate (the renderer's "skeleton transplant" in PrepareComponentSkeleton
+                // mutates drawable.Skeleton in place; using a clone keeps the cached GameFileCache
+                // YFT pristine).
                 var overridePed = new Ped();
                 overridePed.Init(overridePedName, GameFileCache);
                 overridePed.LoadDefaultComponents(GameFileCache);
 
                 var ped = csObj.Ped;
 
-                // Preserve the cutscene skeleton and animation
-                var origSkeleton = ped.Skeleton;
+                // Preserve only the cutscene animation clip — it is skeleton-agnostic
+                // (bone references are by Tag, not array index) and will drive the
+                // override skeleton's matching bones.
                 var origAnimClip = ped.AnimClip;
-                var origExpression = ped.Expression;
-                var origName = ped.Name;
-                var origNameHash = ped.NameHash;
 
-                // Copy the override ped's visual model into the cutscene ped.
+                // Copy the override ped's full visual model + skeleton into the cutscene ped.
                 // This replaces drawables (geometry), textures, per-component expressions,
-                // and supporting data (Ydd, Ytd, variation dicts, etc.).
+                // cloth instances (already initialized against the override skeleton),
+                // supporting data (Ydd, Ytd, Yld, Yed, Yft, variation dicts), AND the
+                // skeleton itself. After this, the cutscene ped IS visually the override
+                // model, with only the animation clip carried over from the original.
                 ped.Name = overridePed.Name;
                 ped.NameHash = overridePed.NameHash;
                 ped.InitData = overridePed.InitData;
                 ped.Ydd = overridePed.Ydd;
                 ped.Ytd = overridePed.Ytd;
                 ped.Ymt = overridePed.Ymt;
+                ped.Yed = overridePed.Yed;
+                ped.Yld = overridePed.Yld;
+                ped.Yft = overridePed.Yft;
+                ped.Skeleton = overridePed.Skeleton;
                 ped.DrawableFilesDict = overridePed.DrawableFilesDict;
                 ped.DrawableFiles = overridePed.DrawableFiles;
                 ped.TextureFilesDict = overridePed.TextureFilesDict;
@@ -677,29 +705,20 @@ namespace CodeWalker.World
                     // Copy per-component expressions from the override ped.
                     // These are used by the Expression VM for facial bone remapping
                     // during animation export — the BoneTracksDict maps animation
-                    // facial bone IDs to skeleton bone IDs, and different ped models
-                    // may have different mappings.
+                    // facial bone IDs to skeleton bone IDs. With the override's skeleton
+                    // and override's expressions in place, facial bone Tags resolve
+                    // correctly.
                     ped.Expressions[i] = overridePed.Expressions[i];
                 }
 
-                // Restore the cutscene skeleton and animation
-                ped.Skeleton = origSkeleton;
+                // Restore the cutscene animation clip — drives the override skeleton.
                 ped.AnimClip = origAnimClip;
-                ped.Expression = origExpression;
 
-                // Override ped's Yft and skeleton are NOT applied — the cutscene skeleton
-                // must be preserved because the animation clip targets its bone hierarchy.
-                // However, we keep the override ped's Yed (expression dictionary) since
-                // per-component expressions need to be resolved from the correct YED.
-                ped.Yed = overridePed.Yed;
-                ped.Yld = overridePed.Yld;
-
-                // Re-resolve the global Expression from the override ped's YED using
-                // the original cutscene expression name. This is needed because the
-                // override ped may have a different expression dictionary, and the
-                // per-component expressions come from the override model's YED.
-                // The global expression provides the VM's bytecode streams and
-                // BoneTracksDict, which must match the override model's face.
+                // Re-resolve the global Expression from the override ped's YED.
+                // The override model may use a different ExpressionName than the original
+                // cutscene ped, and the global Expression provides the VM's bytecode streams
+                // and BoneTracksDict, which must match the override model's face and skeleton.
+                ped.Expression = null;
                 if (overridePed.InitData != null && !string.IsNullOrEmpty(overridePed.InitData.ExpressionName))
                 {
                     var exprhash = JenkHash.GenHash(overridePed.InitData.ExpressionName.ToLowerInvariant());
