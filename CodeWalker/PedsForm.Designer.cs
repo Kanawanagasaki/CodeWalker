@@ -79,6 +79,7 @@
             this.ExportGltfButton = new System.Windows.Forms.Button();
             this.BatchExportGltfButton = new System.Windows.Forms.Button();
             this.EnableRootMotionCheckBox = new System.Windows.Forms.CheckBox();
+            this.ShowAllClipDictsCheckBox = new System.Windows.Forms.CheckBox();
             this.label23 = new System.Windows.Forms.Label();
             this.label22 = new System.Windows.Forms.Label();
             this.ClipComboBox = new System.Windows.Forms.ComboBox();
@@ -661,6 +662,7 @@
             // 
             this.ToolsPedTabPage.Controls.Add(this.BatchExportGltfButton);
             this.ToolsPedTabPage.Controls.Add(this.ExportGltfButton);
+            this.ToolsPedTabPage.Controls.Add(this.ShowAllClipDictsCheckBox);
             this.ToolsPedTabPage.Controls.Add(this.EnableRootMotionCheckBox);
             this.ToolsPedTabPage.Controls.Add(this.label23);
             this.ToolsPedTabPage.Controls.Add(this.label22);
@@ -696,14 +698,14 @@
             this.ToolsPedTabPage.Controls.Add(this.PedNameComboBox);
             this.ToolsPedTabPage.Location = new System.Drawing.Point(4, 22);
             this.ToolsPedTabPage.Name = "ToolsPedTabPage";
-            this.ToolsPedTabPage.Size = new System.Drawing.Size(239, 607);
+            this.ToolsPedTabPage.Size = new System.Drawing.Size(239, 630);
             this.ToolsPedTabPage.TabIndex = 4;
             this.ToolsPedTabPage.Text = "Ped";
             this.ToolsPedTabPage.UseVisualStyleBackColor = true;
             //
             // ExportGltfButton
             //
-            this.ExportGltfButton.Location = new System.Drawing.Point(54, 530);
+            this.ExportGltfButton.Location = new System.Drawing.Point(54, 553);
             this.ExportGltfButton.Name = "ExportGltfButton";
             this.ExportGltfButton.Size = new System.Drawing.Size(182, 28);
             this.ExportGltfButton.TabIndex = 33;
@@ -713,7 +715,7 @@
             //
             // BatchExportGltfButton
             //
-            this.BatchExportGltfButton.Location = new System.Drawing.Point(3, 560);
+            this.BatchExportGltfButton.Location = new System.Drawing.Point(3, 583);
             this.BatchExportGltfButton.Name = "BatchExportGltfButton";
             this.BatchExportGltfButton.Size = new System.Drawing.Size(233, 28);
             this.BatchExportGltfButton.TabIndex = 34;
@@ -723,8 +725,22 @@
             //
             // EnableRootMotionCheckBox
             // 
+            // 
+            // ShowAllClipDictsCheckBox
+            // 
+            this.ShowAllClipDictsCheckBox.AutoSize = true;
+            this.ShowAllClipDictsCheckBox.Location = new System.Drawing.Point(54, 503);
+            this.ShowAllClipDictsCheckBox.Name = "ShowAllClipDictsCheckBox";
+            this.ShowAllClipDictsCheckBox.Size = new System.Drawing.Size(178, 17);
+            this.ShowAllClipDictsCheckBox.TabIndex = 35;
+            this.ShowAllClipDictsCheckBox.Text = "Show all anim dicts";
+            this.ShowAllClipDictsCheckBox.UseVisualStyleBackColor = true;
+            this.ShowAllClipDictsCheckBox.CheckedChanged += new System.EventHandler(this.ShowAllClipDictsCheckBox_CheckedChanged);
+            // 
+            // EnableRootMotionCheckBox
+            // 
             this.EnableRootMotionCheckBox.AutoSize = true;
-            this.EnableRootMotionCheckBox.Location = new System.Drawing.Point(54, 503);
+            this.EnableRootMotionCheckBox.Location = new System.Drawing.Point(54, 526);
             this.EnableRootMotionCheckBox.Name = "EnableRootMotionCheckBox";
             this.EnableRootMotionCheckBox.Size = new System.Drawing.Size(114, 17);
             this.EnableRootMotionCheckBox.TabIndex = 32;
@@ -1223,5 +1239,6 @@
         private System.Windows.Forms.Button ExportGltfButton;
         private System.Windows.Forms.Button BatchExportGltfButton;
         private System.Windows.Forms.CheckBox EnableRootMotionCheckBox;
+        private System.Windows.Forms.CheckBox ShowAllClipDictsCheckBox;
     }
 }

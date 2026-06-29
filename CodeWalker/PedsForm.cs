@@ -78,6 +78,12 @@ namespace CodeWalker
 
         Ped SelectedPed = new Ped();
 
+        // Cache of all clip-dict (YCD) short names, sorted alphabetically.
+        // Populated once in UpdateGlobalPedsUI() and reused by UpdateClipDictComboBox()
+        // to apply the "all anim dicts" vs "selected-ped-only" filter without re-scanning
+        // GameFileCache.YcdDict on every checkbox toggle.
+        List<string> _allYcdNames = new List<string>();
+
 
         ComboBox[] ComponentComboBoxes = null;
         public class ComponentComboItem
@@ -659,31 +665,18 @@ namespace CodeWalker
                 ClipComboBox.Items.Clear();
                 var ycds = GameFileCache.YcdDict.Values.ToList();
                 ycds.Sort((a, b) => { return a.Name.CompareTo(b.Name); });
-                List<string> ycdlist = new List<string>(ycds.Count);
+                _allYcdNames = new List<string>(ycds.Count);
                 foreach (var ycde in ycds)
                 {
-                    ycdlist.Add(ycde.GetShortName());
+                    _allYcdNames.Add(ycde.GetShortName());
                 }
 
                 // Populate the dropdown items themselves (not just the autocomplete source)
-                // so the user can open the combo and pick any clip dictionary. The previous
+                // using the current filter ("all" vs "selected-ped-only"). The previous
                 // implementation only filled AutoCompleteCustomSource, which meant the
                 // dropdown list was empty and the only visible entry was the text set in
                 // LoadPed() (e.g. "move_m@generic" / "move_f@generic").
-                ClipDictComboBox.BeginUpdate();
-                try
-                {
-                    ClipDictComboBox.Items.Clear();
-                    ClipDictComboBox.Items.AddRange(ycdlist.ToArray());
-                }
-                finally
-                {
-                    ClipDictComboBox.EndUpdate();
-                }
-
-                ClipDictComboBox.AutoCompleteCustomSource.Clear();
-                ClipDictComboBox.AutoCompleteCustomSource.AddRange(ycdlist.ToArray());
-                ClipDictComboBox.Text = "";
+                UpdateClipDictComboBox();
 
 
 
@@ -706,6 +699,130 @@ namespace CodeWalker
         }
 
 
+        /// <summary>
+        /// Rebuild ClipDictComboBox.Items and AutoCompleteCustomSource based on the current
+        /// state of ShowAllClipDictsCheckBox and the selected ped.
+        ///
+        /// GTA V ped metadata (CPedModelInfo__InitData) only references ONE clip dictionary
+        /// per ped via ClipDictionaryName (typically "move_m@generic" or "move_f@generic").
+        /// There is no static list of "all clip dicts usable by ped X" — at runtime the game
+        /// dynamically loads scenario/script animation dicts that are not tied to a specific
+        /// ped model. So "anim dicts that belong to the selected ped" can only be approximated
+        /// by combining the ped's ClipDictionaryName with a heuristic substring search for
+        /// YCDs whose name contains the ped model name (e.g. for story peds like
+        /// "ig_lamardavis" there may be matching "anim@ig_lamardavis" / "facials@ig_lamardavis"
+        /// dicts; for generic peds like "a_f_y_beach_01" there usually aren't).
+        ///
+        /// When the checkbox is unchecked (default), only this filtered set is shown so the
+        /// user can quickly pick a relevant anim dict for the current ped. When checked, the
+        /// full list of every YCD in the game cache is shown.
+        /// </summary>
+        private void UpdateClipDictComboBox()
+        {
+            // Preserve the current text so toggling the checkbox or loading a new ped doesn't
+            // wipe the user's selection. ComboBox.Items.Clear() / AddRange() do not change
+            // Text, but AutoCompleteCustomSource changes can sometimes reset the edit box
+            // visually on certain Windows versions; capture+restore is the safe path.
+            string preservedText = ClipDictComboBox.Text;
+
+            List<string> listToShow;
+            if (ShowAllClipDictsCheckBox.Checked)
+            {
+                listToShow = _allYcdNames;
+            }
+            else
+            {
+                listToShow = BuildClipDictsForSelectedPed();
+                if (listToShow.Count == 0)
+                {
+                    // No ped loaded yet (or no matches at all) — fall back to the full list
+                    // so the dropdown is still usable on first launch and for peds with no
+                    // identifiable anim dicts.
+                    listToShow = _allYcdNames;
+                }
+            }
+
+            ClipDictComboBox.BeginUpdate();
+            try
+            {
+                ClipDictComboBox.Items.Clear();
+                ClipDictComboBox.Items.AddRange(listToShow.ToArray());
+            }
+            finally
+            {
+                ClipDictComboBox.EndUpdate();
+            }
+
+            ClipDictComboBox.AutoCompleteCustomSource.Clear();
+            ClipDictComboBox.AutoCompleteCustomSource.AddRange(listToShow.ToArray());
+
+            // Restore the text. Only re-assign if it actually changed, to avoid raising
+            // an extra TextChanged event that would re-trigger LoadClipDict.
+            if (!string.Equals(ClipDictComboBox.Text, preservedText, StringComparison.Ordinal))
+            {
+                ClipDictComboBox.Text = preservedText;
+            }
+        }
+
+
+        /// <summary>
+        /// Build the filtered list of clip-dict names that "belong" to the currently
+        /// selected ped model. Returns an empty list if no ped is loaded.
+        ///
+        /// "Belong to" is approximated as:
+        ///   1. SelectedPed.InitData.ClipDictionaryName — the ped's primary movement anim
+        ///      dict (always included when non-empty).
+        ///   2. Any YCD in _allYcdNames whose short name contains the ped model name as a
+        ///      case-insensitive substring — catches per-ped animation packs shipped for
+        ///      story characters (e.g. "anim@ig_lamardavis").
+        ///
+        /// Note: we use InitData.Name (loaded from ped meta XML) rather than Ped.Name,
+        /// because Ped.Name is not set by Ped.Init() and remains empty for PedsForm peds.
+        /// </summary>
+        private List<string> BuildClipDictsForSelectedPed()
+        {
+            var result = new List<string>();
+            if (SelectedPed?.InitData == null) return result;
+
+            // InitData.Name comes from the ped.meta XML and uses mixed case like
+            // "A_F_Y_Beach_01" or "ig_lamardavis". Compare case-insensitively.
+            string pedName = SelectedPed.InitData.Name;
+            string pedNameLower = pedName?.ToLowerInvariant();
+
+            // 1. Always include the ped's primary ClipDictionaryName.
+            string primaryClipDict = SelectedPed.InitData.ClipDictionaryName;
+            bool hasPrimary = !string.IsNullOrEmpty(primaryClipDict);
+
+            // 2. Substring match for per-ped animation packs.
+            if (!string.IsNullOrEmpty(pedNameLower))
+            {
+                foreach (var ycdName in _allYcdNames)
+                {
+                    if (ycdName == null) continue;
+                    if (ycdName.ToLowerInvariant().Contains(pedNameLower))
+                    {
+                        result.Add(ycdName);
+                    }
+                }
+            }
+
+            // Make sure the primary clip dict is present even if the substring search
+            // didn't catch it (it usually won't, since "move_m@generic" doesn't contain
+            // the ped name).
+            if (hasPrimary && !result.Contains(primaryClipDict))
+            {
+                result.Add(primaryClipDict);
+            }
+
+            result.Sort(StringComparer.OrdinalIgnoreCase);
+            return result;
+        }
+
+
+        private void ShowAllClipDictsCheckBox_CheckedChanged(object sender, EventArgs e)
+        {
+            UpdateClipDictComboBox();
+        }
 
 
 
@@ -766,6 +883,12 @@ namespace CodeWalker
                     PopulateCompCombo(ComponentComboBoxes[i], vi.GetComponentData(i));
                 }
             }
+
+            // Refresh the Clip Dict dropdown filter for the newly-selected ped BEFORE setting
+            // the text. When "Show all anim dicts" is unchecked, this narrows the dropdown to
+            // just the ped's relevant anim dicts (its ClipDictionaryName + any per-ped packs
+            // whose name contains the ped model name). When checked, this is a no-op (full list).
+            UpdateClipDictComboBox();
 
             ClipDictComboBox.Text = SelectedPed.InitData?.ClipDictionaryName ?? "";
             ClipComboBox.Text = "idle";

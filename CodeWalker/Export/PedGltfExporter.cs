@@ -18,7 +18,15 @@ namespace CodeWalker.Export
             var pedData = GltfWriter.BuildPedArmature(ctx, ped, ped.Name ?? "Ped", null, null, null, -1);
             GltfWriter.BuildPedMeshes(ctx, ped, pedData, "");
             if (ped.AnimClip != null)
-                GltfWriter.BuildPedAnimation(ctx, pedData, ped.AnimClip, ped.Name ?? "Ped", ped.Expression);
+            {
+                // Build a merged BoneTracksDict from all per-component expressions, matching
+                // the cutscene exporter's logic. Without this, facial animation tracks
+                // (mouth, eyebrows, etc.) from per-component expressions are silently skipped
+                // when ped.Expression is null or has an incomplete BoneTracksDict.
+                var mergedBoneTracksDict = GltfWriter.BuildMergedBoneTracksDict(ped);
+                GltfWriter.BuildPedAnimation(ctx, pedData, ped.AnimClip, ped.Name ?? "Ped",
+                    ped.Expression, mergedBoneTracksDict);
+            }
 
             if (isGlb) GltfWriter.WriteGlb(ctx, filePath);
             else GltfWriter.WriteGltf(ctx, filePath);

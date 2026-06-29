@@ -778,6 +778,63 @@ namespace CodeWalker.Export
         #region Ped Animation Builder
 
         /// <summary>
+        /// Build a merged BoneTracksDict from all per-component expressions of a ped.
+        ///
+        /// In the GTA V renderer, each ped component (Head, Berd, Hair, etc.) has its own
+        /// Expression loaded from the ped's YED file, keyed by the drawable's name hash.
+        /// The renderer uses ped.Expressions[i] (per-component) for facial bone remapping
+        /// in Renderable.UpdateAnim(). However, the animation clip contains ALL facial
+        /// bone tracks for the entire ped in a single clip — not separated by component.
+        ///
+        /// ped.Expression (the global expression from InitData.ExpressionName) may be null
+        /// or may have an incomplete BoneTracksDict compared to the union of all component
+        /// expressions. When the BoneTracksDict is null or missing entries, facial bone IDs
+        /// in tracks 24/25/26 cannot be remapped to skeleton bone tags, causing those tracks
+        /// to be silently skipped in the export — resulting in no facial animation.
+        ///
+        /// This method merges all BoneTracksDict entries from ped.Expressions[0..11] into a
+        /// single dictionary, ensuring complete facial bone remapping coverage. It also
+        /// includes entries from ped.Expression as a fallback.
+        ///
+        /// This is the canonical implementation shared by both PedGltfExporter and
+        /// CutsceneGltfExporter so that single-ped and cutscene exports use identical
+        /// facial-expression resolution logic.
+        /// </summary>
+        public static Dictionary<ExpressionTrack, ExpressionTrack> BuildMergedBoneTracksDict(Ped ped)
+        {
+            var merged = new Dictionary<ExpressionTrack, ExpressionTrack>();
+
+            // First, add entries from the global expression (lowest priority)
+            if (ped.Expression?.BoneTracksDict != null)
+            {
+                foreach (var kvp in ped.Expression.BoneTracksDict)
+                {
+                    if (!merged.ContainsKey(kvp.Key))
+                        merged[kvp.Key] = kvp.Value;
+                }
+            }
+
+            // Then, add entries from per-component expressions (higher priority, may override)
+            // The renderer uses ped.Expressions[i] per component, so these are the authoritative
+            // source for facial bone remapping.
+            if (ped.Expressions != null)
+            {
+                foreach (var expr in ped.Expressions)
+                {
+                    if (expr?.BoneTracksDict == null) continue;
+                    foreach (var kvp in expr.BoneTracksDict)
+                    {
+                        // Later components override earlier ones for the same key.
+                        // This matches the renderer's sequential application of expressions.
+                        merged[kvp.Key] = kvp.Value;
+                    }
+                }
+            }
+
+            return merged.Count > 0 ? merged : null;
+        }
+
+        /// <summary>
         /// Build animation for a single ped from its ClipMapEntry.
         /// Handles both ClipAnimation and ClipAnimationList, sampling the full animation
         /// time range for proper playback in glTF viewers.
