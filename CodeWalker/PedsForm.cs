@@ -657,15 +657,31 @@ namespace CodeWalker
             {
 
                 ClipComboBox.Items.Clear();
-                ClipDictComboBox.Items.Clear();
                 var ycds = GameFileCache.YcdDict.Values.ToList();
                 ycds.Sort((a, b) => { return a.Name.CompareTo(b.Name); });
-                ClipDictComboBox.AutoCompleteCustomSource.Clear();
-                List<string> ycdlist = new List<string>();
+                List<string> ycdlist = new List<string>(ycds.Count);
                 foreach (var ycde in ycds)
                 {
                     ycdlist.Add(ycde.GetShortName());
                 }
+
+                // Populate the dropdown items themselves (not just the autocomplete source)
+                // so the user can open the combo and pick any clip dictionary. The previous
+                // implementation only filled AutoCompleteCustomSource, which meant the
+                // dropdown list was empty and the only visible entry was the text set in
+                // LoadPed() (e.g. "move_m@generic" / "move_f@generic").
+                ClipDictComboBox.BeginUpdate();
+                try
+                {
+                    ClipDictComboBox.Items.Clear();
+                    ClipDictComboBox.Items.AddRange(ycdlist.ToArray());
+                }
+                finally
+                {
+                    ClipDictComboBox.EndUpdate();
+                }
+
+                ClipDictComboBox.AutoCompleteCustomSource.Clear();
                 ClipDictComboBox.AutoCompleteCustomSource.AddRange(ycdlist.ToArray());
                 ClipDictComboBox.Text = "";
 
