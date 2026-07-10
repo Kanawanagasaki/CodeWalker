@@ -1364,6 +1364,12 @@ namespace CodeWalker.Export
         /// <param name="boneTracksDictOverride">Optional merged BoneTracksDict for facial remapping.</param>
         /// <param name="pedRootNodeIndex">Index of the ped root node (pedData.PedRootNodeIndex).
         /// When provided, root motion channels are added to animate the ped root across cuts.</param>
+        /// <param name="enableRootPosition">When true, the ped root node's translation is animated
+        /// across camera cuts using track 5 (RootPosition). When false, no translation channel is
+        /// emitted for the ped root — it keeps its static position from BuildPedArmature.</param>
+        /// <param name="enableRootRotation">When true, the ped root node's rotation is animated
+        /// across camera cuts using track 6 (RootRotation). When false, no rotation channel is
+        /// emitted for the ped root — it keeps its static rotation from BuildPedArmature.</param>
         public static void BuildPedAnimationMultiCut(
             ExportContext ctx,
             PedArmatureData pedData,
@@ -1372,7 +1378,9 @@ namespace CodeWalker.Export
             string animName,
             Expression expression = null,
             Dictionary<ExpressionTrack, ExpressionTrack> boneTracksDictOverride = null,
-            int? pedRootNodeIndex = null)
+            int? pedRootNodeIndex = null,
+            bool enableRootPosition = true,
+            bool enableRootRotation = true)
         {
             var log = GltfExportLogger.Current;
             log?.BeginScope($"BuildPedAnimationMultiCut: {animName}");
@@ -1402,6 +1410,8 @@ namespace CodeWalker.Export
             log?.Field("  Expression (global)", expression != null ? "OK" : "<null>");
             log?.Field("  BoneTracksDictOverride entries", boneTracksDictOverride?.Count ?? 0);
             log?.Field("  PedRootNodeIndex", pedRootNodeIndex ?? -1);
+            log?.Field("  Enable root position", enableRootPosition);
+            log?.Field("  Enable root rotation", enableRootRotation);
 
             if (validCuts.Count == 0 || totalDuration <= 0)
             {
@@ -1781,13 +1791,23 @@ namespace CodeWalker.Export
             // Root motion channels for the ped root node (tracks 5/6 with boneTag=0).
             // This animates the ped's world position across cuts — without it, the ped
             // would stay at its cut-0 position for the entire timeline.
-            if (pedRootNodeIndex.HasValue && pedRootNodeIndex.Value >= 0)
+            //
+            // The enableRootPosition / enableRootRotation flags let the user selectively
+            // disable one axis of root motion. When both are false, no root motion channels
+            // are emitted at all and the ped root keeps its static transform from
+            // BuildPedArmature for the entire timeline.
+            if (pedRootNodeIndex.HasValue && pedRootNodeIndex.Value >= 0
+                && (enableRootPosition || enableRootRotation))
             {
-                BuildPedRootMotionMultiCut(ctx, anim, validCuts, cutSubAnims, timeAcc, frameCount, frameDelta, pedRootNodeIndex.Value, log);
+                BuildPedRootMotionMultiCut(ctx, anim, validCuts, cutSubAnims, timeAcc, frameCount, frameDelta,
+                    pedRootNodeIndex.Value, enableRootPosition, enableRootRotation, log);
             }
             else
             {
-                log?.Log("  !! pedRootNodeIndex not provided — ped root will not animate across cuts (jump cut position will be wrong)");
+                if (!pedRootNodeIndex.HasValue || pedRootNodeIndex.Value < 0)
+                    log?.Log("  !! pedRootNodeIndex not provided — ped root will not animate across cuts (jump cut position will be wrong)");
+                else if (!enableRootPosition && !enableRootRotation)
+                    log?.Log("  Both root position and root rotation disabled by user — ped root keeps static transform for entire timeline");
             }
 
             log?.Field("  Final anim.channels", anim.channels.Count);
@@ -1935,6 +1955,13 @@ namespace CodeWalker.Export
         /// location for each cut. Without this, the ped would stay at its cut-0 position
         /// for the entire timeline, producing the "jump cut shows wrong location" symptom
         /// where the camera cuts but the ped stays in place.
+        ///
+        /// The enableRootPosition / enableRootRotation flags selectively disable one axis
+        /// of root motion. When a flag is false, the corresponding channel is not emitted
+        /// and the ped root keeps its static transform (from BuildPedArmature) on that
+        /// axis for the entire timeline. This is useful for workflows where the user
+        /// wants only the rotation to animate (e.g., for a character that should stay
+        /// rooted in place but turn to face different directions across cuts).
         /// </summary>
         static void BuildPedRootMotionMultiCut(
             ExportContext ctx,
@@ -1943,22 +1970,40 @@ namespace CodeWalker.Export
             List<List<(Animation Animation, float StartTime, float EndTime)>> cutSubAnims,
             int timeAcc, int frameCount, float frameDelta,
             int pedRootNodeIndex,
+            bool enableRootPosition,
+            bool enableRootRotation,
             GltfExportLogger log)
         {
-            var rootTransVals = new float[frameCount * 3];
-            var rootRotVals = new float[frameCount * 4];
-
-            // Initialize to identity (zero translation, identity rotation) — covers gap frames
-            // where the ped has no clip in any cut.
-            for (int f = 0; f < frameCount; f++)
+            // Only allocate + sample root position data if the user enabled it.
+            // When disabled, we skip the per-cut sampling loop for position entirely
+            // and emit no translation channel — the ped root keeps its static translation.
+            float[] rootTransVals = null;
+            if (enableRootPosition)
             {
-                rootTransVals[f * 3 + 0] = 0f;
-                rootTransVals[f * 3 + 1] = 0f;
-                rootTransVals[f * 3 + 2] = 0f;
-                rootRotVals[f * 4 + 0] = 0f;
-                rootRotVals[f * 4 + 1] = 0f;
-                rootRotVals[f * 4 + 2] = 0f;
-                rootRotVals[f * 4 + 3] = 1f;
+                rootTransVals = new float[frameCount * 3];
+                // Initialize to identity (zero translation) — covers gap frames where
+                // the ped has no clip in any cut.
+                for (int f = 0; f < frameCount; f++)
+                {
+                    rootTransVals[f * 3 + 0] = 0f;
+                    rootTransVals[f * 3 + 1] = 0f;
+                    rootTransVals[f * 3 + 2] = 0f;
+                }
+            }
+
+            // Only allocate + sample root rotation data if the user enabled it.
+            float[] rootRotVals = null;
+            if (enableRootRotation)
+            {
+                rootRotVals = new float[frameCount * 4];
+                // Initialize to identity rotation — covers gap frames.
+                for (int f = 0; f < frameCount; f++)
+                {
+                    rootRotVals[f * 4 + 0] = 0f;
+                    rootRotVals[f * 4 + 1] = 0f;
+                    rootRotVals[f * 4 + 2] = 0f;
+                    rootRotVals[f * 4 + 3] = 1f;
+                }
             }
 
             int sampledFrames = 0;
@@ -1981,6 +2026,8 @@ namespace CodeWalker.Export
                 // Find root position (track 5) and root rotation (track 6) tracks with boneTag=0.
                 // The renderer's updateObjectTransform() uses (boneTag=0, posTrack=5, rotTrack=6)
                 // for the root motion — we replicate that lookup here.
+                // When the corresponding flag is disabled, we skip the lookup for that track
+                // to avoid wasted work.
                 Animation posAnim = null; int posIdx = -1; float posStart = 0f, posEnd = 0f;
                 Animation rotAnim = null; int rotIdx = -1; float rotStart = 0f, rotEnd = 0f;
 
@@ -1992,56 +2039,53 @@ namespace CodeWalker.Export
                     {
                         if (boneIds[bi].BoneId == 0)
                         {
-                            if (boneIds[bi].Track == 5 && posIdx < 0)
+                            if (enableRootPosition && boneIds[bi].Track == 5 && posIdx < 0)
                             { posAnim = sa.Animation; posIdx = bi; posStart = sa.StartTime; posEnd = sa.EndTime; }
-                            else if (boneIds[bi].Track == 6 && rotIdx < 0)
+                            else if (enableRootRotation && boneIds[bi].Track == 6 && rotIdx < 0)
                             { rotAnim = sa.Animation; rotIdx = bi; rotStart = sa.StartTime; rotEnd = sa.EndTime; }
                         }
                     }
-                    if (posIdx >= 0 && rotIdx >= 0) break;
+                    if ((posIdx >= 0 || !enableRootPosition) && (rotIdx >= 0 || !enableRootRotation)) break;
                 }
 
-                log?.Field($"  Root motion cut[{ci}] range", $"[{cutStart:F3}, {cutEnd:F3}]  posIdx={posIdx}  rotIdx={rotIdx}");
+                log?.Field($"  Root motion cut[{ci}] range", $"[{cutStart:F3}, {cutEnd:F3}]  posIdx={posIdx}  rotIdx={rotIdx}  posEnabled={enableRootPosition}  rotEnabled={enableRootRotation}");
 
                 for (int f = frameStart; f <= frameEnd; f++)
                 {
                     float cutOffset = f * frameDelta - cutStart;
-                    Vector3 objPos = Vector3.Zero;
-                    Quaternion objRot = Quaternion.Identity;
 
-                    if (posAnim != null)
+                    if (enableRootPosition && posAnim != null)
                     {
                         try
                         {
                             float t = GetSubAnimPlaybackTime(cutOffset, posStart, posEnd);
                             var fp = posAnim.GetFramePosition(t);
                             var v4 = posAnim.EvaluateVector4(fp, posIdx, true);
-                            objPos = new Vector3(v4.X, v4.Y, v4.Z);
+                            // Convert GTA LH (X,Y,Z) to glTF RH (X,Z,-Y) — same convention as
+                            // BuildSceneRoot and BuildPedArmature use for the static transforms.
+                            int off3 = f * 3;
+                            rootTransVals[off3 + 0] = v4.X;
+                            rootTransVals[off3 + 1] = v4.Z;
+                            rootTransVals[off3 + 2] = -v4.Y;
                         }
                         catch { }
                     }
-                    if (rotAnim != null)
+
+                    if (enableRootRotation && rotAnim != null)
                     {
                         try
                         {
                             float t = GetSubAnimPlaybackTime(cutOffset, rotStart, rotEnd);
                             var fp = rotAnim.GetFramePosition(t);
-                            objRot = rotAnim.EvaluateQuaternion(fp, rotIdx, true);
+                            var q = rotAnim.EvaluateQuaternion(fp, rotIdx, true);
+                            int off4 = f * 4;
+                            rootRotVals[off4 + 0] = q.X;
+                            rootRotVals[off4 + 1] = q.Z;
+                            rootRotVals[off4 + 2] = -q.Y;
+                            rootRotVals[off4 + 3] = q.W;
                         }
                         catch { }
                     }
-
-                    // Convert GTA LH (X,Y,Z) to glTF RH (X,Z,-Y) — same convention as
-                    // BuildSceneRoot and BuildPedArmature use for the static transforms.
-                    int off3 = f * 3;
-                    rootTransVals[off3 + 0] = objPos.X;
-                    rootTransVals[off3 + 1] = objPos.Z;
-                    rootTransVals[off3 + 2] = -objPos.Y;
-                    int off4 = f * 4;
-                    rootRotVals[off4 + 0] = objRot.X;
-                    rootRotVals[off4 + 1] = objRot.Z;
-                    rootRotVals[off4 + 2] = -objRot.Y;
-                    rootRotVals[off4 + 3] = objRot.W;
 
                     sampledFrames++;
                 }
@@ -2049,31 +2093,37 @@ namespace CodeWalker.Export
 
             log?.Field("  Root motion frames sampled", sampledFrames);
 
-            // Write translation accessor + channel for ped root node
-            byte[] transBytes = new byte[rootTransVals.Length * 4];
-            Buffer.BlockCopy(rootTransVals, 0, transBytes, 0, transBytes.Length);
-            int transBv = ctx.AddBufferView(transBytes);
-            int transAcc = ctx.AddAccessor(transBv, 5126, "VEC3", frameCount);
-            int transSidx = anim.samplers.Count;
-            anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = transAcc });
-            anim.channels.Add(new GltfAnimationChannel
+            // Emit translation channel only if position is enabled.
+            if (enableRootPosition)
             {
-                sampler = transSidx,
-                target = new GltfAnimationChannelTarget { node = pedRootNodeIndex, path = "translation" }
-            });
+                byte[] transBytes = new byte[rootTransVals.Length * 4];
+                Buffer.BlockCopy(rootTransVals, 0, transBytes, 0, transBytes.Length);
+                int transBv = ctx.AddBufferView(transBytes);
+                int transAcc = ctx.AddAccessor(transBv, 5126, "VEC3", frameCount);
+                int transSidx = anim.samplers.Count;
+                anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = transAcc });
+                anim.channels.Add(new GltfAnimationChannel
+                {
+                    sampler = transSidx,
+                    target = new GltfAnimationChannelTarget { node = pedRootNodeIndex, path = "translation" }
+                });
+            }
 
-            // Write rotation accessor + channel for ped root node
-            byte[] rotBytes = new byte[rootRotVals.Length * 4];
-            Buffer.BlockCopy(rootRotVals, 0, rotBytes, 0, rotBytes.Length);
-            int rotBv = ctx.AddBufferView(rotBytes);
-            int rotAcc = ctx.AddAccessor(rotBv, 5126, "VEC4", frameCount);
-            int rotSidx = anim.samplers.Count;
-            anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = rotAcc });
-            anim.channels.Add(new GltfAnimationChannel
+            // Emit rotation channel only if rotation is enabled.
+            if (enableRootRotation)
             {
-                sampler = rotSidx,
-                target = new GltfAnimationChannelTarget { node = pedRootNodeIndex, path = "rotation" }
-            });
+                byte[] rotBytes = new byte[rootRotVals.Length * 4];
+                Buffer.BlockCopy(rootRotVals, 0, rotBytes, 0, rotBytes.Length);
+                int rotBv = ctx.AddBufferView(rotBytes);
+                int rotAcc = ctx.AddAccessor(rotBv, 5126, "VEC4", frameCount);
+                int rotSidx = anim.samplers.Count;
+                anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = rotAcc });
+                anim.channels.Add(new GltfAnimationChannel
+                {
+                    sampler = rotSidx,
+                    target = new GltfAnimationChannelTarget { node = pedRootNodeIndex, path = "rotation" }
+                });
+            }
         }
 
         /// <summary>

@@ -40,8 +40,14 @@ namespace CodeWalker.Export
         /// <param name="logger">Optional diagnostic logger. When null, no logging is performed; otherwise
         /// per-ped and per-component state is recorded to help diagnose T-pose / wrong-texture /
         /// wrong-model export issues.</param>
+        /// <param name="enableRootPosition">When true, the ped root node's translation is animated
+        /// across camera cuts using track 5 (RootPosition). When false, the ped root keeps its
+        /// static position from BuildPedArmature for the entire timeline.</param>
+        /// <param name="enableRootRotation">When true, the ped root node's rotation is animated
+        /// across camera cuts using track 6 (RootRotation). When false, the ped root keeps its
+        /// static rotation from BuildPedArmature for the entire timeline.</param>
         public static void Export(Cutscene cutscene, IEnumerable<CutsceneObject> selectedObjects, string filePath,
-            GltfExportLogger logger = null)
+            GltfExportLogger logger = null, bool enableRootPosition = true, bool enableRootRotation = true)
         {
             if (cutscene == null) throw new ArgumentNullException(nameof(cutscene));
             if (selectedObjects == null) throw new ArgumentNullException(nameof(selectedObjects));
@@ -51,6 +57,8 @@ namespace CodeWalker.Export
             log?.Field("Output file", filePath);
             log?.Field("Cutscene position", cutscene.Position.ToString());
             log?.Field("Cutscene rotation", cutscene.Rotation.ToString());
+            log?.Field("Enable root position", enableRootPosition);
+            log?.Field("Enable root rotation", enableRootRotation);
 
             var selectedList = selectedObjects.ToList();
             log?.Field("Selected objects", selectedList.Count);
@@ -226,7 +234,9 @@ namespace CodeWalker.Export
                     pedName,
                     pedData.Armature.Ped.Expression,
                     mergedBoneTracksDict,
-                    pedData.Armature.PedRootNodeIndex);
+                    pedData.Armature.PedRootNodeIndex,
+                    enableRootPosition,
+                    enableRootRotation);
                 log?.Field("  Animations added", ctx.Animations.Count - animsBefore);
                 if (ctx.Animations.Count == animsBefore)
                     log?.Log($"  !! WARNING: no animation produced for {pedName} — exported model will be in T-pose");

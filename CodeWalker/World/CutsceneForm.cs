@@ -566,6 +566,12 @@ namespace CodeWalker.World
                     ApplyPedModelOverride(overrideTarget, overrideName);
                 }
 
+                // Root motion options from the dialog. These control whether the
+                // ped root node's translation and/or rotation is animated across
+                // camera cuts during export.
+                bool enableRootPosition = selDlg.EnableRootPosition;
+                bool enableRootRotation = selDlg.EnableRootRotation;
+
                 using (var sfd = new SaveFileDialog())
                 {
                     sfd.Title = "Export Cutscene as glTF/GLB";
@@ -586,6 +592,8 @@ namespace CodeWalker.World
                         exportLog.Field("Cutscene name",
                             Cutscene?.CutFile?.FileEntry?.GetShortName() ?? "<unknown>");
                         exportLog.Field("Selected object count", selectedObjects.Count());
+                        exportLog.Field("Root position enabled", enableRootPosition);
+                        exportLog.Field("Root rotation enabled", enableRootRotation);
                         if (!string.IsNullOrEmpty(overrideName))
                         {
                             exportLog.Field("Ped model override", overrideName);
@@ -601,7 +609,8 @@ namespace CodeWalker.World
                         try
                         {
                             Cursor = Cursors.WaitCursor;
-                            CutsceneGltfExporter.Export(Cutscene, selectedObjects, sfd.FileName, exportLog);
+                            CutsceneGltfExporter.Export(Cutscene, selectedObjects, sfd.FileName, exportLog,
+                                enableRootPosition, enableRootRotation);
                             Cursor = Cursors.Default;
                             MessageBox.Show(
                                 "Export completed successfully!\n\nFile: " + sfd.FileName +

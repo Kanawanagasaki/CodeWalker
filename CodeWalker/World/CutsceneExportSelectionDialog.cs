@@ -26,6 +26,11 @@ namespace CodeWalker.World
         private Label PedOverrideLabel;
         private ComboBox PedOverrideComboBox;
 
+        // Root motion option controls
+        private GroupBox RootMotionGroupBox;
+        private CheckBox EnableRootPositionCheckbox;
+        private CheckBox EnableRootRotationCheckbox;
+
         private readonly Cutscene _cutscene;
         private readonly GameFileCache _gfc;
         private readonly List<CutsceneObject> _objects = new List<CutsceneObject>();
@@ -34,6 +39,22 @@ namespace CodeWalker.World
         /// The ped model name selected for override, or null/empty if no override.
         /// </summary>
         public string PedModelOverride => PedOverrideComboBox?.SelectedItem as string;
+
+        /// <summary>
+        /// When true, the ped root node's translation is animated across camera cuts
+        /// using track 5 (RootPosition). When false, the ped root stays at its static
+        /// position from BuildPedArmature for the entire timeline.
+        /// Checked by default.
+        /// </summary>
+        public bool EnableRootPosition => EnableRootPositionCheckbox?.Checked ?? true;
+
+        /// <summary>
+        /// When true, the ped root node's rotation is animated across camera cuts
+        /// using track 6 (RootRotation). When false, the ped root keeps its static
+        /// rotation from BuildPedArmature for the entire timeline.
+        /// Checked by default.
+        /// </summary>
+        public bool EnableRootRotation => EnableRootRotationCheckbox?.Checked ?? true;
 
         /// <summary>
         /// The single ped CutsceneObject that will have its model overridden,
@@ -54,8 +75,8 @@ namespace CodeWalker.World
         private void InitializeComponent()
         {
             this.Text = "Select Objects to Export";
-            this.Size = new System.Drawing.Size(480, 580);
-            this.MinimumSize = new System.Drawing.Size(400, 480);
+            this.Size = new System.Drawing.Size(520, 640);
+            this.MinimumSize = new System.Drawing.Size(440, 540);
             this.FormBorderStyle = FormBorderStyle.Sizable;
             this.StartPosition = FormStartPosition.CenterParent;
             this.MaximizeBox = false;
@@ -68,7 +89,7 @@ namespace CodeWalker.World
                 Text = "Select the cutscene objects you want to export as glTF/GLB.\n" +
                        "Only objects with geometry (characters, props, weapons, vehicles) can be exported.",
                 Location = new System.Drawing.Point(12, 12),
-                Size = new System.Drawing.Size(440, 44),
+                Size = new System.Drawing.Size(480, 44),
                 AutoSize = false,
             };
             this.Controls.Add(this.LabelInfo);
@@ -77,19 +98,55 @@ namespace CodeWalker.World
             this.ObjectsCheckedListBox = new CheckedListBox
             {
                 Location = new System.Drawing.Point(12, 62),
-                Size = new System.Drawing.Size(440, 280),
+                Size = new System.Drawing.Size(480, 270),
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 CheckOnClick = true,
             };
             this.ObjectsCheckedListBox.ItemCheck += ObjectsCheckedListBox_ItemCheck;
             this.Controls.Add(this.ObjectsCheckedListBox);
 
+            // Root motion options group box.
+            // These checkboxes control whether the ped root node's translation and/or
+            // rotation is animated across camera cuts during export. Both default to
+            // checked — animating the root is what makes peds move to the correct
+            // position for each camera cut. Uncheck one if you want the root to stay
+            // static on that axis (e.g., export only root rotation, keep position fixed).
+            this.RootMotionGroupBox = new GroupBox
+            {
+                Text = "Root motion (per ped)",
+                Location = new System.Drawing.Point(12, 340),
+                Size = new System.Drawing.Size(480, 64),
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+            };
+            this.Controls.Add(this.RootMotionGroupBox);
+
+            this.EnableRootPositionCheckbox = new CheckBox
+            {
+                Text = "Enable root position (track 5)",
+                Location = new System.Drawing.Point(12, 24),
+                Size = new System.Drawing.Size(220, 24),
+                Checked = true,
+                AutoSize = false,
+            };
+            this.RootMotionGroupBox.Controls.Add(this.EnableRootPositionCheckbox);
+
+            this.EnableRootRotationCheckbox = new CheckBox
+            {
+                Text = "Enable root rotation (track 6)",
+                Location = new System.Drawing.Point(240, 24),
+                Size = new System.Drawing.Size(220, 24),
+                Checked = true,
+                AutoSize = false,
+            };
+            this.RootMotionGroupBox.Controls.Add(this.EnableRootRotationCheckbox);
+
             // Ped model override label
             this.PedOverrideLabel = new Label
             {
                 Text = "Override ped model:",
-                Location = new System.Drawing.Point(12, 352),
+                Location = new System.Drawing.Point(12, 412),
                 Size = new System.Drawing.Size(120, 20),
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
                 Visible = false,
             };
             this.Controls.Add(this.PedOverrideLabel);
@@ -97,8 +154,8 @@ namespace CodeWalker.World
             // Ped model override combobox
             this.PedOverrideComboBox = new ComboBox
             {
-                Location = new System.Drawing.Point(138, 350),
-                Size = new System.Drawing.Size(314, 22),
+                Location = new System.Drawing.Point(138, 410),
+                Size = new System.Drawing.Size(354, 22),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Sorted = false, // already sorted during population
@@ -110,7 +167,7 @@ namespace CodeWalker.World
             this.SelectAllButton = new Button
             {
                 Text = "Select All",
-                Location = new System.Drawing.Point(12, 382),
+                Location = new System.Drawing.Point(12, 444),
                 Size = new System.Drawing.Size(85, 26),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
             };
@@ -126,7 +183,7 @@ namespace CodeWalker.World
             this.DeselectAllButton = new Button
             {
                 Text = "Deselect All",
-                Location = new System.Drawing.Point(103, 382),
+                Location = new System.Drawing.Point(103, 444),
                 Size = new System.Drawing.Size(85, 26),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
             };
@@ -142,7 +199,7 @@ namespace CodeWalker.World
             this.SelectPedsButton = new Button
             {
                 Text = "Peds Only",
-                Location = new System.Drawing.Point(194, 382),
+                Location = new System.Drawing.Point(194, 444),
                 Size = new System.Drawing.Size(85, 26),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
             };
@@ -162,7 +219,7 @@ namespace CodeWalker.World
             {
                 Text = "OK",
                 DialogResult = DialogResult.OK,
-                Location = new System.Drawing.Point(268, 382),
+                Location = new System.Drawing.Point(308, 444),
                 Size = new System.Drawing.Size(90, 26),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
             };
@@ -173,7 +230,7 @@ namespace CodeWalker.World
             {
                 Text = "Cancel",
                 DialogResult = DialogResult.Cancel,
-                Location = new System.Drawing.Point(364, 382),
+                Location = new System.Drawing.Point(404, 444),
                 Size = new System.Drawing.Size(90, 26),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
             };
@@ -225,7 +282,22 @@ namespace CodeWalker.World
 
                 if (!exportable) continue;
 
+                // Build a human-readable display name. For peds, include the ped model
+                // name (from ped.Name if set, otherwise from ped.NameHash which always
+                // resolves to the model name like "player_one" / "cs_lamardavis" via
+                // JenkIndex/MetaNames lookup) so the user can tell peds apart in the
+                // list — without this, every ped just shows as "Object N [Ped]".
                 string displayName = $"Object {obj.ObjectID} {typeLabel}";
+
+                if (obj.Ped != null)
+                {
+                    string pedModel = obj.Ped.Name;
+                    if (string.IsNullOrEmpty(pedModel))
+                        pedModel = obj.Ped.NameHash.ToString();
+                    if (!string.IsNullOrEmpty(pedModel))
+                        displayName += $" <{pedModel}>";
+                }
+
                 if (obj.Name != 0)
                     displayName += $" ({obj.Name})";
 
