@@ -147,43 +147,86 @@ namespace CodeWalker.Export
             }
             log?.EndScope();
 
-            // Build animations for each ped
+            // Build animations for each ped.
+            //
+            // CRITICAL: A cutscene is split into multiple camera cuts, each stored as a
+            // separate YCD file (Cutscene.Ycds[i]). Each YCD's CutsceneMap[obj.AnimHash]
+            // holds the clip for that ped in cut i. The single-clip approach (using only
+            // obj.AnimClip from the first/last Cutscene.Update() call) only exports ONE
+            // cut's worth of animation (~17 seconds for a typical cut), instead of the
+            // full cutscene Duration (~98 seconds).
+            //
+            // To export the FULL cutscene, we gather the ped's clip from EVERY cut and
+            // pass them all to BuildPedAnimationMultiCut, which samples each cut's clip
+            // for the frames that fall within that cut's time range, producing a single
+            // continuous animation spanning the full Duration. The ped's identity is
+            // preserved across the entire timeline — the same skeleton/armature/bone-to-node
+            // mapping is used throughout, and animation data for ped A is never applied to
+            // ped B's bones, even when the cutscene cuts to a different character.
             log?.BeginScope("Build ped animations");
+            float totalDuration = cutscene.Duration;
+            float[] cameraCutList = cutscene.CameraCutList;
+            int cutCount = (cutscene.Ycds?.Length ?? 0);
+            log?.Field("  Cutscene duration (s)", totalDuration);
+            log?.Field("  Camera cut count", cameraCutList?.Length ?? 0);
+            log?.Field("  Ycd count", cutCount);
+
             foreach (var pedData in pedDataList)
             {
-                var animClip = pedData.CutsceneObject.AnimClip ?? pedData.Armature.Ped.AnimClip;
                 string pedName = pedData.Armature.Ped.Name;
                 if (string.IsNullOrEmpty(pedName))
                     pedName = pedData.Armature.Ped.NameHash.ToString();
                 if (string.IsNullOrEmpty(pedName))
                     pedName = "Ped_" + pedData.CutsceneObject.ObjectID;
-                if (animClip == null)
-                {
-                    log?.Log($"  Ped {pedName}: SKIPPED — no AnimClip resolved (will end up in T-pose)");
-                    continue;
-                }
-                if (animClip.Clip == null)
-                {
-                    log?.Log($"  Ped {pedName}: SKIPPED — AnimClip.Clip is null (will end up in T-pose)");
-                    continue;
-                }
 
                 // Build a merged BoneTracksDict from all per-component expressions.
                 // The renderer uses ped.Expressions[i] (per-component) for facial bone remapping,
-                // but BuildPedAnimation only accepts a single BoneTracksDict. Merging all component
-                // expressions ensures every facial bone ID can be remapped, regardless of which
-                // component's expression it came from. This fixes facial animations (mouth, eyebrows,
-                // etc.) being silently skipped in the export when ped.Expression is null or incomplete.
+                // but BuildPedAnimationMultiCut only accepts a single BoneTracksDict. Merging all
+                // component expressions ensures every facial bone ID can be remapped, regardless
+                // of which component's expression it came from. This fixes facial animations
+                // (mouth, eyebrows, etc.) being silently skipped in the export when
+                // ped.Expression is null or incomplete.
                 var mergedBoneTracksDict = GltfWriter.BuildMergedBoneTracksDict(pedData.Armature.Ped);
 
+                // Gather the ped's clip from every cut. Each cut's clip is looked up by the
+                // ped's AnimHash in that cut's YCD's CutsceneMap. Cuts where the ped has no
+                // clip (e.g., the ped is off-screen during that cut) produce null entries
+                // and are skipped inside BuildPedAnimationMultiCut — those frames keep bind pose.
+                var cutClips = new List<(float cutStart, float cutEnd, ClipMapEntry clip)>();
+                int foundClips = 0;
+                for (int ci = 0; ci < cutCount; ci++)
+                {
+                    float cutStart = (ci == 0) ? 0f : cameraCutList[ci - 1];
+                    float cutEnd = (ci < (cameraCutList?.Length ?? 0)) ? cameraCutList[ci] : totalDuration;
+                    if (cutEnd <= cutStart) continue;
+
+                    ClipMapEntry cme = null;
+                    cutscene.Ycds[ci]?.CutsceneMap?.TryGetValue(pedData.CutsceneObject.AnimHash, out cme);
+                    cutClips.Add((cutStart, cutEnd, cme));
+                    if (cme?.Clip != null) foundClips++;
+                }
+
                 log?.Field("  Ped", pedName);
-                log?.Field("  AnimClip hash", animClip.Hash);
-                log?.Field("  AnimClip.Clip type", animClip.Clip.GetType().Name);
+                log?.Field("  AnimHash", pedData.CutsceneObject.AnimHash);
+                log?.Field("  Cuts with clip", $"{foundClips} / {cutClips.Count}");
                 log?.Field("  Merged BoneTracksDict entries", mergedBoneTracksDict?.Count ?? 0);
 
+                if (foundClips == 0)
+                {
+                    log?.Log($"  Ped {pedName}: SKIPPED — no clips found in any cut (will end up in T-pose)");
+                    continue;
+                }
+
                 int animsBefore = ctx.Animations.Count;
-                GltfWriter.BuildPedAnimation(ctx, pedData.Armature, animClip, pedName,
-                    pedData.Armature.Ped.Expression, mergedBoneTracksDict);
+                GltfWriter.BuildPedAnimationMultiCut(
+                    ctx,
+                    pedData.Armature,
+                    cutClips,
+                    totalDuration,
+                    pedName,
+                    pedData.Armature.Ped.Expression,
+                    mergedBoneTracksDict,
+                    pedData.Armature.PedRootNodeIndex);
                 log?.Field("  Animations added", ctx.Animations.Count - animsBefore);
                 if (ctx.Animations.Count == animsBefore)
                     log?.Log($"  !! WARNING: no animation produced for {pedName} — exported model will be in T-pose");

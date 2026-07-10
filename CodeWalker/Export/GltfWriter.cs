@@ -1320,6 +1320,763 @@ namespace CodeWalker.Export
         }
 
         /// <summary>
+        /// Build animation for a single ped across multiple cutscene cuts, producing ONE
+        /// continuous glTF animation spanning the full cutscene Duration.
+        ///
+        /// GTA V cutscenes are split into multiple "camera cuts", each stored as a separate
+        /// YCD file (Cutscene.Ycds[i]). Each YCD contains one ClipMapEntry per ped/object,
+        /// keyed by the ped's AnimHash. The cutscene timeline is the concatenation of all
+        /// cuts: cut 0 spans [0, CameraCutList[0]), cut 1 spans [CameraCutList[0],
+        /// CameraCutList[1]), ..., cut N spans [CameraCutList[N-1], Duration).
+        ///
+        /// The single-cut BuildPedAnimation only samples one clip — so a 98-second cutscene
+        /// with 6 cuts of ~17 seconds each only exports the first 17 seconds. This method
+        /// fixes that by sampling each cut's clip for the frames that fall within that
+        /// cut's time range, producing a single animation that spans the full Duration.
+        ///
+        /// PED IDENTITY IS PRESERVED: the same skeleton, armature, and bone-to-node mapping
+        /// is used for the entire timeline. Animation data for ped A is never applied to
+        /// ped B's bones — each ped has its own PedArmatureData and its own animation,
+        /// built from that ped's own clips across all cuts. When the cutscene cuts to a
+        /// different character, ped A's animation simply holds bind pose for the frames
+        /// where ped A has no clip (matching renderer behavior — bones initialize to bind
+        /// pose each frame, then animation tracks are applied).
+        ///
+        /// Additionally, this method animates the ped ROOT node's translation/rotation
+        /// using root motion tracks (T=5 RootPosition, T=6 RootRotation, boneTag=0)
+        /// sampled across all cuts. This is critical: each cut places the ped at a
+        /// different world position, and without root motion animation the ped would
+        /// stay at its cut-0 position for the entire timeline — producing the "jump cut
+        /// shows wrong location" symptom.
+        ///
+        /// Frames not covered by any cut (gaps where the ped is hidden / not yet on
+        /// screen) keep bind-pose values, matching what the renderer does when a ped's
+        /// AnimClip is null for a given cut.
+        /// </summary>
+        /// <param name="ctx">The export context</param>
+        /// <param name="pedData">Per-ped armature data from BuildPedArmature</param>
+        /// <param name="cutClips">List of (cutStart, cutEnd, clip) tuples — one per camera cut.
+        /// Cuts with null clips are skipped. The union of [cutStart, cutEnd] ranges should
+        /// cover [0, totalDuration].</param>
+        /// <param name="totalDuration">Total cutscene duration in seconds (Cutscene.Duration).</param>
+        /// <param name="animName">Name for the animation</param>
+        /// <param name="expression">Optional Expression for facial bone remapping.</param>
+        /// <param name="boneTracksDictOverride">Optional merged BoneTracksDict for facial remapping.</param>
+        /// <param name="pedRootNodeIndex">Index of the ped root node (pedData.PedRootNodeIndex).
+        /// When provided, root motion channels are added to animate the ped root across cuts.</param>
+        public static void BuildPedAnimationMultiCut(
+            ExportContext ctx,
+            PedArmatureData pedData,
+            List<(float cutStart, float cutEnd, ClipMapEntry clip)> cutClips,
+            float totalDuration,
+            string animName,
+            Expression expression = null,
+            Dictionary<ExpressionTrack, ExpressionTrack> boneTracksDictOverride = null,
+            int? pedRootNodeIndex = null)
+        {
+            var log = GltfExportLogger.Current;
+            log?.BeginScope($"BuildPedAnimationMultiCut: {animName}");
+
+            var skeleton = pedData.Ped.Skeleton;
+            if (skeleton == null)
+            {
+                log?.Log("  !! ped.Skeleton is NULL — animation will be skipped (T-pose)");
+                log?.EndScope();
+                return;
+            }
+
+            // Filter to cuts with non-null clips and positive duration
+            var validCuts = new List<(float cutStart, float cutEnd, ClipMapEntry clip)>();
+            foreach (var c in cutClips)
+            {
+                if (c.clip?.Clip != null && c.cutEnd > c.cutStart)
+                    validCuts.Add(c);
+            }
+
+            log?.Field("  Input cuts", cutClips.Count);
+            log?.Field("  Valid cuts (with clip)", validCuts.Count);
+            log?.Field("  Total duration (s)", totalDuration);
+            log?.Field("  Ped.Name", pedData.Ped.Name ?? "<null>");
+            log?.Field("  Skeleton bone count", skeleton.Bones?.Items?.Length ?? 0);
+            log?.Field("  BoneTagToNode entries", pedData.BoneTagToNode.Count);
+            log?.Field("  Expression (global)", expression != null ? "OK" : "<null>");
+            log?.Field("  BoneTracksDictOverride entries", boneTracksDictOverride?.Count ?? 0);
+            log?.Field("  PedRootNodeIndex", pedRootNodeIndex ?? -1);
+
+            if (validCuts.Count == 0 || totalDuration <= 0)
+            {
+                log?.Log("  !! no valid cuts or zero duration — animation will be skipped (T-pose)");
+                log?.EndScope();
+                return;
+            }
+
+            // Build per-cut subAnimations lists.
+            // Each cut's ClipMapEntry may be a ClipAnimation (single sub-anim) or
+            // ClipAnimationList (multiple sub-anims applied sequentially). The renderer
+            // iterates all sub-anims in a ClipAnimationList, applying each on top of the
+            // previous — we replicate that here per cut.
+            var cutSubAnims = new List<List<(Animation Animation, float StartTime, float EndTime)>>();
+            foreach (var (cutStart, cutEnd, clip) in validCuts)
+            {
+                var sa = new List<(Animation, float, float)>();
+                if (clip.Clip is ClipAnimation ca && ca.Animation != null)
+                    sa.Add((ca.Animation, ca.StartTime, ca.EndTime));
+                else if (clip.Clip is ClipAnimationList cal && cal.Animations != null)
+                    foreach (var e in cal.Animations)
+                        if (e?.Animation != null)
+                            sa.Add((e.Animation, e.StartTime, e.EndTime));
+                cutSubAnims.Add(sa);
+            }
+
+            // Determine frame count: ~30 fps over totalDuration, capped to keep file size reasonable.
+            // Cap at ~5 minutes worth (9000 frames at 30fps) to prevent runaway exports on
+            // extremely long cutscenes.
+            int frameCount = (int)Math.Ceiling(totalDuration * 30f);
+            if (frameCount < 2) frameCount = 2;
+            if (frameCount > 9000) frameCount = 9000;
+            float frameDelta = totalDuration / (frameCount - 1);
+
+            log?.Field("  Frame count (export)", frameCount);
+            log?.Field("  Frame delta", frameDelta);
+
+            // Time accessor — single time accessor shared by all samplers in this animation.
+            // Spans [0, totalDuration] so glTF viewers play the full cutscene length.
+            var timeData = new float[frameCount];
+            for (int f = 0; f < frameCount; f++) timeData[f] = f * frameDelta;
+            byte[] timeBytes = new byte[frameCount * 4];
+            Buffer.BlockCopy(timeData, 0, timeBytes, 0, timeBytes.Length);
+            int timeBv = ctx.AddBufferView(timeBytes);
+            int timeAcc = ctx.AddAccessor(timeBv, 5126, "SCALAR", frameCount, new float[] { 0f }, new float[] { totalDuration });
+
+            // channelData: (nodeIdx, path) -> List<float> with exactly frameCount*stride entries,
+            // pre-initialized to bind-pose values. Frames in cut ranges get overwritten with
+            // sampled values; frames NOT in any cut (gaps) keep bind pose — matching renderer
+            // behavior where bones initialize to bind pose each frame before tracks are applied.
+            var channelData = new Dictionary<(int nodeIdx, string path), List<float>>();
+            var rotationBoneTags = new HashSet<ushort>();
+
+            // faceTrackAnimValues: per (animBoneId, track) -> Vector4[frameCount], initialized to zero.
+            // The Expression VM reads these to compute facial expression deltas. Frames in cut
+            // ranges get the sampled facial track values; frames in gaps stay zero (no input).
+            var faceTrackAnimValues = new Dictionary<(ushort BoneId, byte Track), Vector4[]>();
+
+            int tracksProcessed = 0, tracksResolvedToNode = 0;
+            var tracksByType = new Dictionary<byte, int>();
+            var tracksUnresolvedByType = new Dictionary<byte, int>();
+            var unresolvedBodyBoneIds = new List<ushort>();
+            var loggedMissingBones = new HashSet<ushort>();
+
+            // Local helper: get-or-create a channel pre-filled with bind-pose values for all frames.
+            // Uses a local function so we can capture channelData, skeleton, frameCount without
+            // passing them through every call site.
+            List<float> GetOrCreateChannel(int nodeIdx, string path, ushort boneTag)
+            {
+                var key = (nodeIdx, path);
+                if (channelData.TryGetValue(key, out var existing))
+                    return existing;
+
+                int stride = path == "rotation" ? 4 : 3;
+                var list = new List<float>(frameCount * stride);
+                Bone b = null;
+                skeleton.BonesMap?.TryGetValue(boneTag, out b);
+                for (int f = 0; f < frameCount; f++)
+                {
+                    if (path == "translation")
+                    {
+                        list.Add(b?.Translation.X ?? 0f);
+                        list.Add(b?.Translation.Z ?? 0f);
+                        list.Add(-(b?.Translation.Y ?? 0f));
+                    }
+                    else if (path == "rotation")
+                    {
+                        list.Add(b?.Rotation.X ?? 0f);
+                        list.Add(b?.Rotation.Z ?? 0f);
+                        list.Add(-(b?.Rotation.Y ?? 0f));
+                        list.Add(b?.Rotation.W ?? 1f);
+                    }
+                    else // scale
+                    {
+                        list.Add(b?.Scale.X ?? 1f);
+                        list.Add(b?.Scale.Z ?? 1f);
+                        list.Add(b?.Scale.Y ?? 1f);
+                    }
+                }
+                channelData[key] = list;
+                return list;
+            }
+
+            // Local helper: get-or-create face track anim values array, initialized to zero.
+            Vector4[] GetOrCreateFaceTrackValues(ushort boneId, byte track)
+            {
+                var key = (boneId, track);
+                if (faceTrackAnimValues.TryGetValue(key, out var existing))
+                    return existing;
+                var arr = new Vector4[frameCount];
+                for (int f = 0; f < frameCount; f++) arr[f] = Vector4.Zero;
+                faceTrackAnimValues[key] = arr;
+                return arr;
+            }
+
+            // Iterate per cut, sample each cut's sub-anims for frames in [cutStart, cutEnd].
+            // This is more efficient than per-frame iteration (which would re-resolve the cut
+            // for every frame), and it lets us batch the sampling per track within a cut.
+            for (int ci = 0; ci < validCuts.Count; ci++)
+            {
+                var (cutStart, cutEnd, _) = validCuts[ci];
+                var subAnims = cutSubAnims[ci];
+
+                // Determine frame range for this cut, matching the renderer's half-open
+                // interval [cutStart, cutEnd) — EXCEPT for the last cut, which uses a
+                // closed interval [cutStart, cutEnd] so the final frame at t=totalDuration
+                // is included. Without this special case, the last frame (which sits
+                // exactly on t=totalDuration due to frameDelta = totalDuration/(frameCount-1))
+                // would be excluded and left at bind pose.
+                int frameStart = (int)Math.Ceiling(cutStart / frameDelta);
+                int frameEnd;
+                if (ci == validCuts.Count - 1)
+                    frameEnd = (int)Math.Floor((cutEnd + 0.0001f) / frameDelta);
+                else
+                    frameEnd = (int)Math.Floor((cutEnd - 0.0001f) / frameDelta);
+                if (frameStart < 0) frameStart = 0;
+                if (frameEnd > frameCount - 1) frameEnd = frameCount - 1;
+                if (frameStart > frameEnd) continue;
+
+                log?.Field($"  Cut[{ci}] range", $"[{cutStart:F3}, {cutEnd:F3}]  frames [{frameStart}, {frameEnd}]  subAnims={subAnims.Count}");
+
+                int subIdx = 0;
+                foreach (var subAnim in subAnims)
+                {
+                    var animData = subAnim.Animation;
+                    var boneIds = animData.BoneIds?.data_items;
+                    if (boneIds == null) { subIdx++; continue; }
+
+                    for (int bi = 0; bi < boneIds.Length; bi++)
+                    {
+                        var boneId = boneIds[bi];
+                        tracksProcessed++;
+                        tracksByType[boneId.Track] = tracksByType.TryGetValue(boneId.Track, out var c) ? c + 1 : 1;
+
+                        // For facial tracks (24/25/26), remap bone ID through the BoneTracksDict.
+                        // Same logic as BuildPedAnimation — replicates the renderer's facial
+                        // bone remapping in Renderable.cs UpdateAnim().
+                        ushort effectiveBoneId = boneId.BoneId;
+                        if (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26)
+                        {
+                            var btDict = boneTracksDictOverride ?? expression?.BoneTracksDict;
+                            if (btDict != null)
+                            {
+                                var exprbt = new ExpressionTrack() { BoneId = boneId.BoneId, Track = boneId.Track, Flags = boneId.Unk0 };
+                                if (btDict.TryGetValue(exprbt, out var exprbtmap))
+                                    effectiveBoneId = exprbtmap.BoneId;
+                                else
+                                {
+                                    var altKey = new ExpressionTrack() { BoneId = boneId.BoneId, Track = boneId.Track, Flags = (byte)(boneId.Unk0 | 0x80) };
+                                    if (btDict.TryGetValue(altKey, out var altRemap))
+                                        effectiveBoneId = altRemap.BoneId;
+                                }
+                            }
+                        }
+
+                        ushort lookupBoneId = (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26) ? effectiveBoneId : boneId.BoneId;
+                        if (!pedData.BoneTagToNode.TryGetValue(lookupBoneId, out int nodeIdx))
+                        {
+                            tracksUnresolvedByType[boneId.Track] = tracksUnresolvedByType.TryGetValue(boneId.Track, out var uc) ? uc + 1 : 1;
+                            if (boneId.Track <= 2)
+                            {
+                                unresolvedBodyBoneIds.Add(boneId.BoneId);
+                                if (loggedMissingBones.Add(boneId.BoneId))
+                                    log?.Log($"           !! BONE LOOKUP FAILED: track={boneId.Track} boneId=0x{boneId.BoneId:X4}({boneId.BoneId}) — not in ped skeleton (will be dropped, contributing to T-pose)");
+                            }
+                            continue;
+                        }
+                        tracksResolvedToNode++;
+
+                        Bone bone = null;
+                        if (boneId.Track == 24 || boneId.Track == 25 || boneId.Track == 26)
+                            pedData.Ped.Skeleton?.BonesMap?.TryGetValue(effectiveBoneId, out bone);
+
+                        // Sample this track for each frame in [frameStart, frameEnd].
+                        // For frame f, the cut-relative time is (f * frameDelta - cutStart),
+                        // which is then mapped into the sub-anim's [StartTime, EndTime] range
+                        // via GetSubAnimPlaybackTime (handles looping within the sub-anim).
+                        if (boneId.Track == 0) // Translation
+                        {
+                            var vals = GetOrCreateChannel(nodeIdx, "translation", lookupBoneId);
+                            for (int f = frameStart; f <= frameEnd; f++)
+                            {
+                                Vector3 val = Vector3.Zero;
+                                try
+                                {
+                                    float t = GetSubAnimPlaybackTime(f * frameDelta - cutStart, subAnim.StartTime, subAnim.EndTime);
+                                    var fp = animData.GetFramePosition(t);
+                                    var v4 = animData.EvaluateVector4(fp, bi, true);
+                                    val = new Vector3(v4.X, v4.Y, v4.Z);
+                                }
+                                catch { }
+                                int off = f * 3;
+                                vals[off] = val.X; vals[off + 1] = val.Z; vals[off + 2] = -val.Y;
+                            }
+                        }
+                        else if (boneId.Track == 1) // Rotation
+                        {
+                            var vals = GetOrCreateChannel(nodeIdx, "rotation", lookupBoneId);
+                            for (int f = frameStart; f <= frameEnd; f++)
+                            {
+                                Quaternion val = Quaternion.Identity;
+                                try
+                                {
+                                    float t = GetSubAnimPlaybackTime(f * frameDelta - cutStart, subAnim.StartTime, subAnim.EndTime);
+                                    var fp = animData.GetFramePosition(t);
+                                    val = animData.EvaluateQuaternion(fp, bi, true);
+                                }
+                                catch { }
+                                int off = f * 4;
+                                vals[off] = val.X; vals[off + 1] = val.Z; vals[off + 2] = -val.Y; vals[off + 3] = val.W;
+                            }
+                            rotationBoneTags.Add(lookupBoneId);
+                        }
+                        else if (boneId.Track == 2) // Scale
+                        {
+                            var vals = GetOrCreateChannel(nodeIdx, "scale", lookupBoneId);
+                            for (int f = frameStart; f <= frameEnd; f++)
+                            {
+                                Vector3 val = Vector3.One;
+                                try
+                                {
+                                    float t = GetSubAnimPlaybackTime(f * frameDelta - cutStart, subAnim.StartTime, subAnim.EndTime);
+                                    var fp = animData.GetFramePosition(t);
+                                    var v4 = animData.EvaluateVector4(fp, bi, true);
+                                    val = new Vector3(v4.X, v4.Y, v4.Z);
+                                }
+                                catch { }
+                                int off = f * 3;
+                                vals[off] = val.X; vals[off + 1] = val.Z; vals[off + 2] = val.Y;
+                            }
+                        }
+                        else if (boneId.Track == 24) // Face translation
+                        {
+                            if (bone == null) continue;
+                            var vals = GetOrCreateChannel(nodeIdx, "translation", lookupBoneId);
+                            var faceVals = GetOrCreateFaceTrackValues(boneId.BoneId, (byte)boneId.Track);
+                            for (int f = frameStart; f <= frameEnd; f++)
+                            {
+                                try
+                                {
+                                    float t = GetSubAnimPlaybackTime(f * frameDelta - cutStart, subAnim.StartTime, subAnim.EndTime);
+                                    var fp = animData.GetFramePosition(t);
+                                    var v4 = animData.EvaluateVector4(fp, bi, true);
+                                    faceVals[f] = v4;
+                                    var fv = new Vector3(0, v4.X * 0.005f, 0);
+                                    var animTrans = bone.Translation + bone.Rotation.Multiply(fv);
+                                    int off = f * 3;
+                                    vals[off] = animTrans.X; vals[off + 1] = animTrans.Z; vals[off + 2] = -animTrans.Y;
+                                }
+                                catch { }
+                            }
+                        }
+                        else if (boneId.Track == 25) // Face rotation (Euler)
+                        {
+                            if (bone == null) continue;
+                            var vals = GetOrCreateChannel(nodeIdx, "rotation", lookupBoneId);
+                            var faceVals = GetOrCreateFaceTrackValues(boneId.BoneId, (byte)boneId.Track);
+                            float mult = -0.314159265f;
+                            for (int f = frameStart; f <= frameEnd; f++)
+                            {
+                                try
+                                {
+                                    float t = GetSubAnimPlaybackTime(f * frameDelta - cutStart, subAnim.StartTime, subAnim.EndTime);
+                                    var fp = animData.GetFramePosition(t);
+                                    var v4 = animData.EvaluateVector4(fp, bi, true);
+                                    faceVals[f] = v4;
+                                    var q = Quaternion.RotationYawPitchRoll(v4.Z * mult, v4.Y * mult, v4.X * mult);
+                                    if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
+                                    var animRot = bone.Rotation * q;
+                                    int off = f * 4;
+                                    vals[off] = animRot.X; vals[off + 1] = animRot.Z; vals[off + 2] = -animRot.Y; vals[off + 3] = animRot.W;
+                                }
+                                catch { }
+                            }
+                            rotationBoneTags.Add(lookupBoneId);
+                        }
+                        else if (boneId.Track == 26) // Face rotation (Quaternion)
+                        {
+                            if (bone == null) continue;
+                            var vals = GetOrCreateChannel(nodeIdx, "rotation", lookupBoneId);
+                            var faceVals = GetOrCreateFaceTrackValues(boneId.BoneId, (byte)boneId.Track);
+                            for (int f = frameStart; f <= frameEnd; f++)
+                            {
+                                try
+                                {
+                                    float t = GetSubAnimPlaybackTime(f * frameDelta - cutStart, subAnim.StartTime, subAnim.EndTime);
+                                    var fp = animData.GetFramePosition(t);
+                                    var q = animData.EvaluateQuaternion(fp, bi, true);
+                                    faceVals[f] = new Vector4(q.X, q.Y, q.Z, q.W);
+                                    if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
+                                    var animRot = bone.Rotation * q;
+                                    int off = f * 4;
+                                    vals[off] = animRot.X; vals[off + 1] = animRot.Z; vals[off + 2] = -animRot.Y; vals[off + 3] = animRot.W;
+                                }
+                                catch { }
+                            }
+                            rotationBoneTags.Add(lookupBoneId);
+                        }
+                    }
+                    subIdx++;
+                }
+            }
+
+            log?.Field("  Tracks processed", tracksProcessed);
+            log?.Field("  Tracks resolved to a node", tracksResolvedToNode);
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var kv in tracksByType.OrderBy(k => k.Key))
+                    sb.Append($"T{kv.Key}={kv.Value} ");
+                log?.Field("  Tracks by type", sb.ToString().Trim());
+
+                var usb = new System.Text.StringBuilder();
+                foreach (var kv in tracksUnresolvedByType.OrderBy(k => k.Key))
+                    usb.Append($"T{kv.Key}={kv.Value} ");
+                log?.Field("  Unresolved tracks by type", usb.Length == 0 ? "<none>" : usb.ToString().Trim());
+            }
+            if (unresolvedBodyBoneIds.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var bid in unresolvedBodyBoneIds.Distinct().OrderBy(x => x))
+                    sb.Append($"0x{bid:X4} ");
+                log?.Field("  Unresolved BODY bone IDs", sb.ToString().Trim());
+            }
+            log?.Field("  Unique (nodeIdx,path) channels produced", channelData.Count);
+            log?.Field("  Face tracks captured for VM seeding", faceTrackAnimValues.Count);
+
+            // Run the Expression VM. It modifies channelData in place (overriding facial
+            // bone channels with VM-computed values). The subAnimations parameter is unused
+            // inside ApplyExpressionVm — passing null is safe.
+            ApplyExpressionVm(pedData, skeleton, null, frameCount, frameDelta,
+                channelData, rotationBoneTags, expression, boneTracksDictOverride, faceTrackAnimValues);
+
+            // Create the glTF animation
+            var anim = new GltfAnimation { name = animName + "_Anim" };
+
+            // Convert channelData to glTF channels — one channel per unique (nodeIdx, path).
+            foreach (var kvp in channelData)
+            {
+                var key = kvp.Key;
+                var vals = kvp.Value;
+                bool isRotation = key.path == "rotation";
+                string accessorType = isRotation ? "VEC4" : "VEC3";
+
+                byte[] vb = new byte[vals.Count * 4];
+                Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                int valBv = ctx.AddBufferView(vb);
+                int valAcc = ctx.AddAccessor(valBv, 5126, accessorType, frameCount);
+                int sidx = anim.samplers.Count;
+                anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                anim.channels.Add(new GltfAnimationChannel { sampler = sidx, target = new GltfAnimationChannelTarget { node = key.nodeIdx, path = key.path } });
+            }
+
+            // ThighRoll rotation copy — multi-cut aware version. For each frame, finds the
+            // appropriate cut's Thigh rotation track and copies it to the ThighRoll bone.
+            CopyThighRollRotationMultiCut(ctx, pedData, anim, validCuts, cutSubAnims, timeAcc, frameCount, frameDelta, rotationBoneTags);
+
+            // Root motion channels for the ped root node (tracks 5/6 with boneTag=0).
+            // This animates the ped's world position across cuts — without it, the ped
+            // would stay at its cut-0 position for the entire timeline.
+            if (pedRootNodeIndex.HasValue && pedRootNodeIndex.Value >= 0)
+            {
+                BuildPedRootMotionMultiCut(ctx, anim, validCuts, cutSubAnims, timeAcc, frameCount, frameDelta, pedRootNodeIndex.Value, log);
+            }
+            else
+            {
+                log?.Log("  !! pedRootNodeIndex not provided — ped root will not animate across cuts (jump cut position will be wrong)");
+            }
+
+            log?.Field("  Final anim.channels", anim.channels.Count);
+            log?.Field("  Final anim.samplers", anim.samplers.Count);
+            if (anim.channels.Count == 0)
+                log?.Log("  !! FINAL: animation has 0 channels — exported model will be in T-pose");
+
+            if (anim.channels.Count > 0)
+                ctx.Animations.Add(anim);
+            log?.EndScope();
+        }
+
+        /// <summary>
+        /// Multi-cut aware version of CopyThighRollRotation. For each frame, finds the
+        /// appropriate cut's Thigh rotation track and copies it to the ThighRoll bone.
+        ///
+        /// This replicates the hardcoded hack from Renderable.cs (lines 517-528):
+        ///   RB_L_ThighRoll copies rotation from SKEL_L_Thigh
+        ///   RB_R_ThighRoll copies rotation from SKEL_R_Thigh
+        /// but extended to handle the multi-cut case where each frame's thigh rotation
+        /// comes from a different cut's clip.
+        /// </summary>
+        static void CopyThighRollRotationMultiCut(
+            ExportContext ctx,
+            PedArmatureData pedData,
+            GltfAnimation anim,
+            List<(float cutStart, float cutEnd, ClipMapEntry clip)> validCuts,
+            List<List<(Animation Animation, float StartTime, float EndTime)>> cutSubAnims,
+            int timeAcc, int frameCount, float frameDelta,
+            HashSet<ushort> rotationBoneTags)
+        {
+            var bones = pedData.BoneTagToNode;
+            var rollMappings = new[]
+            {
+                (rollTag: BoneTag_RB_L_ThighRoll, thighTag: BoneTag_SKEL_L_Thigh),
+                (rollTag: BoneTag_RB_R_ThighRoll, thighTag: BoneTag_SKEL_R_Thigh),
+            };
+
+            foreach (var mapping in rollMappings)
+            {
+                if (!bones.TryGetValue(mapping.rollTag, out int rollNodeIdx)) continue;
+                if (!bones.TryGetValue(mapping.thighTag, out int thighNodeIdx)) continue;
+                if (rotationBoneTags.Contains(mapping.rollTag)) continue;
+                if (!rotationBoneTags.Contains(mapping.thighTag)) continue;
+
+                // If ThighRoll's parent is the Thigh bone, rotation is inherited naturally.
+                bool parentIsThigh = false;
+                if (ctx.NodeChildren.TryGetValue(thighNodeIdx, out var children))
+                    parentIsThigh = children.Contains(rollNodeIdx);
+                if (parentIsThigh) continue;
+
+                // Pre-fill with bind-pose rotation for all frames (covers gap frames).
+                var vals = new List<float>(frameCount * 4);
+                Bone rollBone = null;
+                pedData.Ped.Skeleton?.BonesMap?.TryGetValue(mapping.rollTag, out rollBone);
+                for (int f = 0; f < frameCount; f++)
+                {
+                    vals.Add(rollBone?.Rotation.X ?? 0f);
+                    vals.Add(rollBone?.Rotation.Z ?? 0f);
+                    vals.Add(-(rollBone?.Rotation.Y ?? 0f));
+                    vals.Add(rollBone?.Rotation.W ?? 1f);
+                }
+
+                // For each cut, find the thigh rotation track and sample it for frames in this cut's range.
+                for (int ci = 0; ci < validCuts.Count; ci++)
+                {
+                    var (cutStart, cutEnd, _) = validCuts[ci];
+                    var subAnims = cutSubAnims[ci];
+
+                    int frameStart = (int)Math.Ceiling(cutStart / frameDelta);
+                    int frameEnd;
+                    if (ci == validCuts.Count - 1)
+                        frameEnd = (int)Math.Floor((cutEnd + 0.0001f) / frameDelta);
+                    else
+                        frameEnd = (int)Math.Floor((cutEnd - 0.0001f) / frameDelta);
+                    if (frameStart < 0) frameStart = 0;
+                    if (frameEnd > frameCount - 1) frameEnd = frameCount - 1;
+                    if (frameStart > frameEnd) continue;
+
+                    // Find thigh rotation track in this cut's sub-anims
+                    Animation thighAnimData = null;
+                    int thighBoneIdx = -1;
+                    float thighStartTime = 0f, thighEndTime = 0f;
+                    foreach (var subAnim in subAnims)
+                    {
+                        var boneIds = subAnim.Animation.BoneIds?.data_items;
+                        if (boneIds == null) continue;
+                        for (int bi = 0; bi < boneIds.Length; bi++)
+                        {
+                            if (boneIds[bi].BoneId == mapping.thighTag && boneIds[bi].Track == 1)
+                            {
+                                thighAnimData = subAnim.Animation;
+                                thighBoneIdx = bi;
+                                thighStartTime = subAnim.StartTime;
+                                thighEndTime = subAnim.EndTime;
+                                break;
+                            }
+                        }
+                        if (thighBoneIdx >= 0) break;
+                    }
+                    if (thighBoneIdx < 0 || thighAnimData == null) continue;
+
+                    for (int f = frameStart; f <= frameEnd; f++)
+                    {
+                        Quaternion val = Quaternion.Identity;
+                        try
+                        {
+                            float t = GetSubAnimPlaybackTime(f * frameDelta - cutStart, thighStartTime, thighEndTime);
+                            var fp = thighAnimData.GetFramePosition(t);
+                            val = thighAnimData.EvaluateQuaternion(fp, thighBoneIdx, true);
+                        }
+                        catch { }
+                        int off = f * 4;
+                        vals[off] = val.X; vals[off + 1] = val.Z; vals[off + 2] = -val.Y; vals[off + 3] = val.W;
+                    }
+                }
+
+                byte[] vb = new byte[vals.Count * 4];
+                Buffer.BlockCopy(vals.ToArray(), 0, vb, 0, vb.Length);
+                int valBv = ctx.AddBufferView(vb);
+                int valAcc = ctx.AddAccessor(valBv, 5126, "VEC4", frameCount);
+                int sidx = anim.samplers.Count;
+                anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = valAcc });
+                anim.channels.Add(new GltfAnimationChannel
+                {
+                    sampler = sidx,
+                    target = new GltfAnimationChannelTarget { node = rollNodeIdx, path = "rotation" }
+                });
+            }
+        }
+
+        /// <summary>
+        /// Build root motion channels for the ped root node by sampling tracks 5
+        /// (RootPosition) and 6 (RootRotation) with boneTag=0 across all cuts.
+        ///
+        /// The ped root node's translation/rotation is set to obj.Position/obj.Rotation
+        /// (in glTF coordinates) — which is the OBJECT position relative to the cutscene
+        /// origin (NOT world space). The scene root node already has the cutscene's world
+        /// Position/Rotation, so the ped root inherits the world transform naturally
+        /// through the node hierarchy: world = scene_root * ped_root.
+        ///
+        /// For each frame, we determine which cut's clip to sample and retrieve the root
+        /// motion for that cut. This replicates the per-cut obj.Position/obj.Rotation
+        /// updates performed by Cutscene.Update() — ensuring the ped moves to the correct
+        /// location for each cut. Without this, the ped would stay at its cut-0 position
+        /// for the entire timeline, producing the "jump cut shows wrong location" symptom
+        /// where the camera cuts but the ped stays in place.
+        /// </summary>
+        static void BuildPedRootMotionMultiCut(
+            ExportContext ctx,
+            GltfAnimation anim,
+            List<(float cutStart, float cutEnd, ClipMapEntry clip)> validCuts,
+            List<List<(Animation Animation, float StartTime, float EndTime)>> cutSubAnims,
+            int timeAcc, int frameCount, float frameDelta,
+            int pedRootNodeIndex,
+            GltfExportLogger log)
+        {
+            var rootTransVals = new float[frameCount * 3];
+            var rootRotVals = new float[frameCount * 4];
+
+            // Initialize to identity (zero translation, identity rotation) — covers gap frames
+            // where the ped has no clip in any cut.
+            for (int f = 0; f < frameCount; f++)
+            {
+                rootTransVals[f * 3 + 0] = 0f;
+                rootTransVals[f * 3 + 1] = 0f;
+                rootTransVals[f * 3 + 2] = 0f;
+                rootRotVals[f * 4 + 0] = 0f;
+                rootRotVals[f * 4 + 1] = 0f;
+                rootRotVals[f * 4 + 2] = 0f;
+                rootRotVals[f * 4 + 3] = 1f;
+            }
+
+            int sampledFrames = 0;
+
+            for (int ci = 0; ci < validCuts.Count; ci++)
+            {
+                var (cutStart, cutEnd, _) = validCuts[ci];
+                var subAnims = cutSubAnims[ci];
+
+                int frameStart = (int)Math.Ceiling(cutStart / frameDelta);
+                int frameEnd;
+                if (ci == validCuts.Count - 1)
+                    frameEnd = (int)Math.Floor((cutEnd + 0.0001f) / frameDelta);
+                else
+                    frameEnd = (int)Math.Floor((cutEnd - 0.0001f) / frameDelta);
+                if (frameStart < 0) frameStart = 0;
+                if (frameEnd > frameCount - 1) frameEnd = frameCount - 1;
+                if (frameStart > frameEnd) continue;
+
+                // Find root position (track 5) and root rotation (track 6) tracks with boneTag=0.
+                // The renderer's updateObjectTransform() uses (boneTag=0, posTrack=5, rotTrack=6)
+                // for the root motion — we replicate that lookup here.
+                Animation posAnim = null; int posIdx = -1; float posStart = 0f, posEnd = 0f;
+                Animation rotAnim = null; int rotIdx = -1; float rotStart = 0f, rotEnd = 0f;
+
+                foreach (var sa in subAnims)
+                {
+                    var boneIds = sa.Animation.BoneIds?.data_items;
+                    if (boneIds == null) continue;
+                    for (int bi = 0; bi < boneIds.Length; bi++)
+                    {
+                        if (boneIds[bi].BoneId == 0)
+                        {
+                            if (boneIds[bi].Track == 5 && posIdx < 0)
+                            { posAnim = sa.Animation; posIdx = bi; posStart = sa.StartTime; posEnd = sa.EndTime; }
+                            else if (boneIds[bi].Track == 6 && rotIdx < 0)
+                            { rotAnim = sa.Animation; rotIdx = bi; rotStart = sa.StartTime; rotEnd = sa.EndTime; }
+                        }
+                    }
+                    if (posIdx >= 0 && rotIdx >= 0) break;
+                }
+
+                log?.Field($"  Root motion cut[{ci}] range", $"[{cutStart:F3}, {cutEnd:F3}]  posIdx={posIdx}  rotIdx={rotIdx}");
+
+                for (int f = frameStart; f <= frameEnd; f++)
+                {
+                    float cutOffset = f * frameDelta - cutStart;
+                    Vector3 objPos = Vector3.Zero;
+                    Quaternion objRot = Quaternion.Identity;
+
+                    if (posAnim != null)
+                    {
+                        try
+                        {
+                            float t = GetSubAnimPlaybackTime(cutOffset, posStart, posEnd);
+                            var fp = posAnim.GetFramePosition(t);
+                            var v4 = posAnim.EvaluateVector4(fp, posIdx, true);
+                            objPos = new Vector3(v4.X, v4.Y, v4.Z);
+                        }
+                        catch { }
+                    }
+                    if (rotAnim != null)
+                    {
+                        try
+                        {
+                            float t = GetSubAnimPlaybackTime(cutOffset, rotStart, rotEnd);
+                            var fp = rotAnim.GetFramePosition(t);
+                            objRot = rotAnim.EvaluateQuaternion(fp, rotIdx, true);
+                        }
+                        catch { }
+                    }
+
+                    // Convert GTA LH (X,Y,Z) to glTF RH (X,Z,-Y) — same convention as
+                    // BuildSceneRoot and BuildPedArmature use for the static transforms.
+                    int off3 = f * 3;
+                    rootTransVals[off3 + 0] = objPos.X;
+                    rootTransVals[off3 + 1] = objPos.Z;
+                    rootTransVals[off3 + 2] = -objPos.Y;
+                    int off4 = f * 4;
+                    rootRotVals[off4 + 0] = objRot.X;
+                    rootRotVals[off4 + 1] = objRot.Z;
+                    rootRotVals[off4 + 2] = -objRot.Y;
+                    rootRotVals[off4 + 3] = objRot.W;
+
+                    sampledFrames++;
+                }
+            }
+
+            log?.Field("  Root motion frames sampled", sampledFrames);
+
+            // Write translation accessor + channel for ped root node
+            byte[] transBytes = new byte[rootTransVals.Length * 4];
+            Buffer.BlockCopy(rootTransVals, 0, transBytes, 0, transBytes.Length);
+            int transBv = ctx.AddBufferView(transBytes);
+            int transAcc = ctx.AddAccessor(transBv, 5126, "VEC3", frameCount);
+            int transSidx = anim.samplers.Count;
+            anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = transAcc });
+            anim.channels.Add(new GltfAnimationChannel
+            {
+                sampler = transSidx,
+                target = new GltfAnimationChannelTarget { node = pedRootNodeIndex, path = "translation" }
+            });
+
+            // Write rotation accessor + channel for ped root node
+            byte[] rotBytes = new byte[rootRotVals.Length * 4];
+            Buffer.BlockCopy(rootRotVals, 0, rotBytes, 0, rotBytes.Length);
+            int rotBv = ctx.AddBufferView(rotBytes);
+            int rotAcc = ctx.AddAccessor(rotBv, 5126, "VEC4", frameCount);
+            int rotSidx = anim.samplers.Count;
+            anim.samplers.Add(new GltfAnimationSampler { input = timeAcc, output = rotAcc });
+            anim.channels.Add(new GltfAnimationChannel
+            {
+                sampler = rotSidx,
+                target = new GltfAnimationChannelTarget { node = pedRootNodeIndex, path = "rotation" }
+            });
+        }
+
+        /// <summary>
         /// Execute the Expression VM for each animation frame and apply VM output to
         /// channel data, overriding animation-applied values for face bones.
         ///
