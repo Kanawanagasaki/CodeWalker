@@ -3482,6 +3482,13 @@ namespace CodeWalker.Rendering
         public void RenderPed(Ped ped)
         {
 
+            // Set eye-debug ped name context directly from the Ped object.
+            // This is a safety net — Cutscene.Render() also sets this, but
+            // setting it here ensures it works regardless of the call path
+            // (e.g. PedsForm, cutscene, world).
+            try { EyeDebugLog.PedName = ped?.Name ?? ""; }
+            catch { }
+
             YftFile yft = ped.Yft;// GameFileCache.GetYft(SelectedModelHash);
             if (yft != null)
             {

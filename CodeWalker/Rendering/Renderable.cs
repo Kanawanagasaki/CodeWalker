@@ -103,6 +103,13 @@ namespace CodeWalker.Rendering
         // (thigh rolls, arms, etc.) are handled by the animation system, not the VM.
         private HashSet<ushort> _faceBoneIds = new HashSet<ushort>();
 
+        // Set of EYEBALL bone IDs that had REAL (non-default) animation T25 data this frame.
+        // The animation T25 (face euler) track is the primary driver of eye direction.
+        // If it has real data for an eyeball, the VM should NOT override it (causes jitter).
+        // If it has NO data (only defaults), the VM should drive that eyeball instead.
+        // Without this, the R eyeball (which has no T25 animation data) would be immobile.
+        private HashSet<ushort> _eyeballsWithAnimData = new HashSet<ushort>();
+
         /// <summary>
         /// Set to true to enable the expression VM execution.
         /// When disabled, the animation loop's face track handling (T24/25/26) works normally.
@@ -140,9 +147,10 @@ namespace CodeWalker.Rendering
         /// <summary>
         /// Rotation angle scale for VM output on NON-eye face bones (jaw, eyebrows, etc.).
         /// Reduces the VM's over-large quaternion rotation to match the animation loop's
-        /// magnitude. Empirically tuned: 0.3 works well for bones with blend weight ≈ 0.5.
+        /// magnitude. Empirically tuned: 0.4 gives slightly more expressive brows/face
+        /// movement (bumped up from 0.3 — brows were moving too little).
         /// </summary>
-        public const float VmRotScaleFace = 0.3f;
+        public const float VmRotScaleFace = 0.4f;
 
         /// <summary>
         /// Rotation angle scale for VM output on EYE bones specifically.
@@ -158,7 +166,7 @@ namespace CodeWalker.Rendering
         /// animation loop uses a 0.005 scale on T=24. This factor reduces
         /// VM position offsets to a comparable magnitude.
         /// </summary>
-        public const float VmPosScale = 0.3f;
+        public const float VmPosScale = 0.4f;
 
         /// <summary>
         /// Maximum allowed position offset magnitude for face bones (VM output).
@@ -588,6 +596,8 @@ namespace CodeWalker.Rendering
             if (CurrentAnimTime == realTime) return;//already updated this!
             CurrentAnimTime = realTime;
 
+            EyeDebugLog.BeginFrame(realTime);
+
             EnableRootMotion = ClipMapEntry?.EnableRootMotion ?? false;
 
             if (ClipMapEntry != null)
@@ -596,6 +606,23 @@ namespace CodeWalker.Rendering
             }
 
             UpdateBoneTransforms();
+
+            // ── Final-state snapshot for eye bones ──
+            // After UpdateAnim + UpdateBoneTransforms, dump the final AnimRotation /
+            // AnimTranslation for every bone whose name contains "Eye". This is what
+            // the renderer actually sees. If the per-stage logs above look smooth but
+            // this snapshot jitters, the corruption happens between (e.g. in
+            // UpdateBoneTransforms or via bone-swap proxies).
+            var finalSkel = Skeleton;
+            if (finalSkel?.BonesSorted != null)
+            {
+                foreach (var fb in finalSkel.BonesSorted)
+                {
+                    if (fb == null || !EyeDebugLog.IsEyeBoneName(fb.Name)) continue;
+                    EyeDebugLog.LogQuaternion("FINAL", fb.Name, (ushort)fb.Tag, "AnimRotation", fb.AnimRotation);
+                    EyeDebugLog.LogVector3("FINAL", fb.Name, (ushort)fb.Tag, "AnimTranslation", fb.AnimTranslation);
+                }
+            }
 
             foreach (var model in HDModels)
             {
@@ -610,6 +637,8 @@ namespace CodeWalker.Rendering
                 }
             }
 
+            EyeDebugLog.EndFrame();
+
         }
         private void UpdateAnim(ClipMapEntry cme)
         {
@@ -622,6 +651,7 @@ namespace CodeWalker.Rendering
             // from multiple animations in a ClipAnimationList are accumulated.
             _faceTrackAnimValues.Clear();
             _faceBoneIds.Clear();
+            _eyeballsWithAnimData.Clear();
 
             var clipanim = cme.Clip as ClipAnimation;
             if (clipanim?.Animation != null)
@@ -636,6 +666,66 @@ namespace CodeWalker.Rendering
                 {
                     if (canim?.Animation == null) continue;
                     UpdateAnim(canim.Animation, canim.GetPlaybackTime(CurrentAnimTime));
+                }
+            }
+
+            // ── Mirror eyeball rotations for eyes without animation data ──
+            // In GTA V cutscenes, both eyes should look at the same point. The animation
+            // T25 track typically only has real look-at data for ONE eyeball (e.g. L).
+            // The other eyeball (R) has only default/constant T25 values and relies on
+            // the expression VM, which fires too infrequently and with wrong magnitudes.
+            //
+            // Fix: after the animation loop, for each eyeball that has NO real animation
+            // data, mirror the rotation from the opposite eyeball. Since both eyeballs
+            // have identity bind rotation and are symmetric about the XZ plane, the mirror
+            // is simply: q_R = (q_L.X, -q_L.Y, q_L.Z, q_L.W).
+            //
+            // This ensures both eyes track the same point smoothly, driven by the animation
+            // data that does exist.
+            {
+                var mirrorBones = Skeleton?.BonesSorted;
+                if (mirrorBones != null && _eyeballsWithAnimData.Count > 0)
+                {
+                    Bone lEyeBall = null, rEyeBall = null;
+                    foreach (var b in mirrorBones)
+                    {
+                        if (b?.Name == null) continue;
+                        if (b.Name.IndexOf("eyeball", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            if (b.Name.IndexOf("_L_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                b.Name.IndexOf("left", StringComparison.OrdinalIgnoreCase) >= 0)
+                                lEyeBall = b;
+                            else if (b.Name.IndexOf("_R_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     b.Name.IndexOf("right", StringComparison.OrdinalIgnoreCase) >= 0)
+                                rEyeBall = b;
+                        }
+                    }
+
+                    // If L has anim data but R doesn't, mirror L → R
+                    if (lEyeBall != null && rEyeBall != null &&
+                        _eyeballsWithAnimData.Contains((ushort)lEyeBall.Tag) &&
+                        !_eyeballsWithAnimData.Contains((ushort)rEyeBall.Tag))
+                    {
+                        var q = lEyeBall.AnimRotation;
+                        rEyeBall.AnimRotation = new Quaternion(q.X, -q.Y, q.Z, q.W);
+                        // Mark R as having data so the VM skips it (we just set it from L)
+                        _eyeballsWithAnimData.Add((ushort)rEyeBall.Tag);
+                        if (EyeDebugLog.IsEyeBoneName(rEyeBall.Name))
+                            EyeDebugLog.Log("EYE-MIRROR", rEyeBall.Name, (ushort)rEyeBall.Tag,
+                                "Mirrored from L eyeball: (" + q.X + ", " + q.Y + ", " + q.Z + ", " + q.W + ") -> (" + q.X + ", " + (-q.Y) + ", " + q.Z + ", " + q.W + ")");
+                    }
+                    // If R has anim data but L doesn't, mirror R → L
+                    else if (lEyeBall != null && rEyeBall != null &&
+                             _eyeballsWithAnimData.Contains((ushort)rEyeBall.Tag) &&
+                             !_eyeballsWithAnimData.Contains((ushort)lEyeBall.Tag))
+                    {
+                        var q = rEyeBall.AnimRotation;
+                        lEyeBall.AnimRotation = new Quaternion(q.X, -q.Y, q.Z, q.W);
+                        _eyeballsWithAnimData.Add((ushort)lEyeBall.Tag);
+                        if (EyeDebugLog.IsEyeBoneName(lEyeBall.Name))
+                            EyeDebugLog.Log("EYE-MIRROR", lEyeBall.Name, (ushort)lEyeBall.Tag,
+                                "Mirrored from R eyeball: (" + q.X + ", " + q.Y + ", " + q.Z + ", " + q.W + ") -> (" + q.X + ", " + (-q.Y) + ", " + q.Z + ", " + q.W + ")");
+                    }
                 }
             }
 
@@ -808,7 +898,14 @@ namespace CodeWalker.Rendering
                         break;
                     case 1: //bone orientation
                         q = anim.EvaluateQuaternion(frame, i, interpolate);
+                        if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                        {
+                            EyeDebugLog.LogQuaternion("ANIM-T1", bone.Name, (ushort)bone.Tag, "interp_q", q);
+                            EyeDebugLog.LogQuaternion("ANIM-T1", bone.Name, (ushort)bone.Tag, "bind_Rotation", bone.Rotation);
+                        }
                         bone.AnimRotation = q;
+                        if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                            EyeDebugLog.LogQuaternion("ANIM-T1", bone.Name, (ushort)bone.Tag, "assigned_AnimRotation", bone.AnimRotation);
                         break;
                     case 2: //scale?
                         v = anim.EvaluateVector4(frame, i, interpolate);
@@ -835,16 +932,103 @@ namespace CodeWalker.Rendering
                         v = anim.EvaluateVector4(frame, i, interpolate); //vector3 roll/pitch/yaw
                         q = Quaternion.RotationYawPitchRoll(v.Z * AnimFaceEulerMultiplier, v.Y * AnimFaceEulerMultiplier, v.X * AnimFaceEulerMultiplier);
                         // Ensure consistent quaternion hemisphere to prevent eye/face bone flipping
+                        bool wasNeg25 = q.W < 0;
                         if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
+
+                        // Track which EYEBALL bones have real (non-default) animation data.
+                        // Default T25 euler = (0, 0, 0.01, 0). If X or Y is non-zero, the
+                        // animation has real look-at data for this eyeball → VM should NOT
+                        // override it. If only defaults, the VM should drive the eyeball.
+                        bool isEyeBallT25 = EyeDebugLog.IsEyeBoneName(bone.Name) &&
+                            bone.Name.IndexOf("eyeball", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool hasRealAnimDataT25 = isEyeBallT25 &&
+                            (Math.Abs(v.X) > 0.0001f || Math.Abs(v.Y) > 0.0001f);
+                        if (hasRealAnimDataT25)
+                        {
+                            _eyeballsWithAnimData.Add((ushort)bone.Tag);
+                        }
+
+                        if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                        {
+                            EyeDebugLog.LogVector4("ANIM-T25", bone.Name, (ushort)bone.Tag, "raw_euler_v", v);
+                            EyeDebugLog.LogQuaternion("ANIM-T25", bone.Name, (ushort)bone.Tag, "euler->q (post-W-fix)", q);
+                            EyeDebugLog.Log("ANIM-T25", bone.Name, (ushort)bone.Tag, "W was negative: " + wasNeg25);
+                            EyeDebugLog.LogQuaternion("ANIM-T25", bone.Name, (ushort)bone.Tag, "bind_Rotation", bone.Rotation);
+                            EyeDebugLog.Log("ANIM-T25", bone.Name, (ushort)bone.Tag,
+                                "hasRealAnimData: " + _eyeballsWithAnimData.Contains((ushort)bone.Tag));
+                        }
+
+                        // ── SKIP T25 assignment for EYEBALLS with no real animation data ──
+                        // The animation T25 track for some eyeballs (e.g. R eyeball in
+                        // car_5_ext) contains only constant default values (0, 0, 0.01, 0)
+                        // which produce a near-identity rotation. Applying this every frame
+                        // resets the eyeball to bind pose, fighting with the VM which only
+                        // fires on a subset of frames. This causes the eyeball to jump
+                        // between bind pose (animation) and the VM-driven position.
+                        //
+                        // Fix: if this is an eyeball with no real animation data, do NOT
+                        // assign the T25 rotation. Leave the bone's AnimRotation at its
+                        // previous value (from bind pose or the last VM update) so the VM
+                        // can drive it cleanly without being reset every frame.
+                        //
+                        // The FIRST time through (before any VM update), the bone's
+                        // AnimRotation is whatever UpdateBoneTransforms set it to (bind
+                        // rotation), which is correct as a starting point.
+                        if (isEyeBallT25 && !hasRealAnimDataT25)
+                        {
+                            if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                                EyeDebugLog.Log("ANIM-T25-SKIP", bone.Name, (ushort)bone.Tag, "EYEBALL with no real anim data: skipping T25 assignment, leaving previous rotation for VM to drive");
+                            break;
+                        }
+
                         bone.AnimRotation = bone.Rotation * q;
+                        if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                            EyeDebugLog.LogQuaternion("ANIM-T25", bone.Name, (ushort)bone.Tag, "assigned_AnimRotation", bone.AnimRotation);
                         break;
                     case 26://face stuff
                         q = anim.EvaluateQuaternion(frame, i, interpolate);
                         // Ensure consistent quaternion hemisphere to prevent eye/face bone flipping.
                         // The animation data may return q or -q between frames (same rotation,
                         // different sign), which causes bone.Rotation * q to jump ~180°.
+                        bool wasNeg26 = q.W < 0;
+                        if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                        {
+                            EyeDebugLog.LogQuaternion("ANIM-T26", bone.Name, (ushort)bone.Tag, "interp_q (pre-W-fix)", q);
+                            EyeDebugLog.Log("ANIM-T26", bone.Name, (ushort)bone.Tag,
+                                string.Format("frame: Frame0={0} Frame1={1} Alpha0={2:F6} Alpha1={3:F6}",
+                                    frame.Frame0, frame.Frame1, frame.Alpha0, frame.Alpha1));
+                            // Re-evaluate the two source keyframes directly so we can see whether
+                            // the per-frame jitter originates from FastLerp (opposite-hemisphere
+                            // keyframes) or from the keyframe DATA itself changing wildly.
+                            try
+                            {
+                                int s26 = frame.Frame0 / anim.SequenceFrameLimit;
+                                int f0_26 = frame.Frame0 % anim.SequenceFrameLimit;
+                                int f1_26 = f0_26 + 1;
+                                var seq26 = anim.Sequences.data_items[s26];
+                                var aseq26 = seq26.Sequences[i];
+                                var q0_26 = aseq26.EvaluateQuaternion(f0_26);
+                                var q1_26 = aseq26.EvaluateQuaternion(f1_26);
+                                EyeDebugLog.LogQuaternion("ANIM-T26", bone.Name, (ushort)bone.Tag, "raw_q0 (keyframe)", q0_26);
+                                EyeDebugLog.LogQuaternion("ANIM-T26", bone.Name, (ushort)bone.Tag, "raw_q1 (keyframe+1)", q1_26);
+                                float dot26 = q0_26.X * q1_26.X + q0_26.Y * q1_26.Y + q0_26.Z * q1_26.Z + q0_26.W * q1_26.W;
+                                EyeDebugLog.LogFloat("ANIM-T26", bone.Name, (ushort)bone.Tag, "dot(q0, q1)", dot26);
+                            }
+                            catch (Exception ex)
+                            {
+                                EyeDebugLog.Log("ANIM-T26", bone.Name, (ushort)bone.Tag, "keyframe re-eval failed: " + ex.Message);
+                            }
+                        }
                         if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
+                        if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                        {
+                            EyeDebugLog.Log("ANIM-T26", bone.Name, (ushort)bone.Tag, "W was negative: " + wasNeg26);
+                            EyeDebugLog.LogQuaternion("ANIM-T26", bone.Name, (ushort)bone.Tag, "q (post-W-fix)", q);
+                            EyeDebugLog.LogQuaternion("ANIM-T26", bone.Name, (ushort)bone.Tag, "bind_Rotation", bone.Rotation);
+                        }
                         bone.AnimRotation = bone.Rotation * q;
+                        if (EyeDebugLog.IsEyeBoneName(bone.Name))
+                            EyeDebugLog.LogQuaternion("ANIM-T26", bone.Name, (ushort)bone.Tag, "assigned_AnimRotation", bone.AnimRotation);
                         break;
                     case 27:
                     case 50:
@@ -1220,6 +1404,7 @@ namespace CodeWalker.Rendering
                             // The VM's BlendQuaternion may produce quaternions with W < 0,
                             // which represent the same rotation as -q (W > 0) but cause
                             // bone.Rotation * q to jump ~180° when mixed with bind pose.
+                            bool vmWasNeg = vmQuat.W < 0;
                             if (vmQuat.W < 0) vmQuat = new Quaternion(-vmQuat.X, -vmQuat.Y, -vmQuat.Z, -vmQuat.W);
 
                             // Scale VM rotation output to match animation loop's magnitude.
@@ -1238,6 +1423,7 @@ namespace CodeWalker.Rendering
                                 targetBone.Name.IndexOf("Eye", StringComparison.OrdinalIgnoreCase) >= 0;
                             float rotScale = isEyeBone ? VmRotScaleEye : VmRotScaleFace;
                             float vmAngle = 2.0f * (float)Math.Acos(Math.Min(1.0f, Math.Abs(vmQuat.W)));
+                            Quaternion vmQuatPreScale = vmQuat;
                             if (vmAngle > 0.001f)
                             {
                                 float scaledAngle = vmAngle * rotScale;
@@ -1252,6 +1438,49 @@ namespace CodeWalker.Rendering
                                 vmQuat = Quaternion.Normalize(vmQuat);
                             }
 
+                            bool isEyeBall = !string.IsNullOrEmpty(targetBone.Name) &&
+                                targetBone.Name.IndexOf("eyeball", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                            if (EyeDebugLog.IsEyeBoneName(targetBone.Name))
+                            {
+                                EyeDebugLog.LogVector4("VM-T1-IN", targetBone.Name, skelBoneId, "raw_vm_val", val);
+                                EyeDebugLog.LogQuaternion("VM-T1", targetBone.Name, skelBoneId, "vmQuat (pre-W-fix from val)", new Quaternion(val.X, val.Y, val.Z, val.W));
+                                EyeDebugLog.Log("VM-T1", targetBone.Name, skelBoneId, "W was negative: " + vmWasNeg);
+                                EyeDebugLog.LogQuaternion("VM-T1", targetBone.Name, skelBoneId, "vmQuat (post-W-fix)", vmQuatPreScale);
+                                EyeDebugLog.LogFloat("VM-T1", targetBone.Name, skelBoneId, "vmAngle (rad)", vmAngle);
+                                EyeDebugLog.LogFloat("VM-T1", targetBone.Name, skelBoneId, "rotScale", rotScale);
+                                EyeDebugLog.LogQuaternion("VM-T1", targetBone.Name, skelBoneId, "vmQuat (post-scale)", vmQuat);
+                                EyeDebugLog.LogQuaternion("VM-T1", targetBone.Name, skelBoneId, "bind_Rotation", targetBone.Rotation);
+                            }
+
+                            // ── SKIP VM rotation override for EYEBALL bones that have animation data ──
+                            // The animation T25 (face euler) track is the primary driver of eye
+                            // direction. If it has real (non-default) data for an eyeball, the VM
+                            // should NOT override it — the VM fires intermittently with large
+                            // rotations that cause per-frame jitter when mixed with animation.
+                            //
+                            // However, some eyeballs have NO animation T25 data (only defaults).
+                            // For those, the VM IS the correct driver — skipping it would leave
+                            // the eye immobile at bind pose. Only skip if the animation actually
+                            // provided real look-at data for this eyeball this frame.
+                            //
+                            // Empirical evidence (car_5_ext cutscene, cs_molly):
+                            //   - L eyeball: 1470 T25 entries with varying euler values → has anim data → skip VM
+                            //   - R eyeball: 735 T25 entries, ALL default (0,0,0.01,0) → no anim data → apply VM
+                            //   - VM values for R eyeball are smooth and consistent (not jumping),
+                            //     confirming the VM is the correct driver when animation is absent.
+                            if (isEyeBall && _eyeballsWithAnimData.Contains(skelBoneId))
+                            {
+                                if (EyeDebugLog.IsEyeBoneName(targetBone.Name))
+                                    EyeDebugLog.Log("VM-T1-SKIP", targetBone.Name, skelBoneId, "EYEBALL with anim data: skipping VM, animation drives this eye");
+                                continue;
+                            }
+                            if (isEyeBall)
+                            {
+                                if (EyeDebugLog.IsEyeBoneName(targetBone.Name))
+                                    EyeDebugLog.Log("VM-T1-APPLY", targetBone.Name, skelBoneId, "EYEBALL without anim data: applying VM, VM drives this eye");
+                            }
+
                             // Apply as delta from bind pose: bind rotation * VM delta quaternion.
                             // The VM's TrackSet replaces the identity default, so the output is
                             // just the computed rotation delta. This matches the animation loop's
@@ -1259,6 +1488,9 @@ namespace CodeWalker.Rendering
                             targetBone.AnimRotation = Quaternion.Normalize(
                                 targetBone.Rotation * vmQuat);
                             appliedCount++;
+
+                            if (EyeDebugLog.IsEyeBoneName(targetBone.Name))
+                                EyeDebugLog.LogQuaternion("VM-T1", targetBone.Name, skelBoneId, "assigned_AnimRotation", targetBone.AnimRotation);
                         }
 
                         // ── PASS 2: Apply positions (T=0) using updated AnimRotation ──
@@ -1321,6 +1553,14 @@ namespace CodeWalker.Rendering
                             // relative to the face's actual (animated) orientation, not the bind pose.
                             targetBone.AnimTranslation = targetBone.Translation + targetBone.AnimRotation.Multiply(posOffset);
                             appliedCount++;
+
+                            if (EyeDebugLog.IsEyeBoneName(targetBone.Name))
+                            {
+                                EyeDebugLog.LogVector4("VM-T0-IN", targetBone.Name, skelBoneId, "raw_vm_val", val);
+                                EyeDebugLog.LogVector3("VM-T0", targetBone.Name, skelBoneId, "posOffset (scaled)", posOffset);
+                                EyeDebugLog.LogVector3("VM-T0", targetBone.Name, skelBoneId, "bind_Translation", targetBone.Translation);
+                                EyeDebugLog.LogVector3("VM-T0", targetBone.Name, skelBoneId, "assigned_AnimTranslation", targetBone.AnimTranslation);
+                            }
                         }
                     }
 

@@ -1868,6 +1868,19 @@ namespace CodeWalker.World
         public void Render(Renderer renderer)
         {
 
+            // ── Set eye-debug context: cutscene name + cutscene-relative time ──
+            // This is set ONCE per render frame for the whole cutscene. The per-ped
+            // name is set inside the loop below, right before each RenderPed call.
+            // EyeDebugLog.BeginFrame (called from Renderable.UpdateAnims) reads these
+            // static fields and includes them in every frame header + applies filters.
+            try
+            {
+                EyeDebugLog.CutsceneName = CutFile?.FileEntry?.GetShortNameLower() ?? "";
+                EyeDebugLog.CutsceneTime = PlaybackTime;
+                EyeDebugLog.CutsceneDuration = Duration;
+            }
+            catch { }
+
             if (SceneObjects != null)
             {
                 foreach (var obj in SceneObjects.Values)
@@ -1876,6 +1889,13 @@ namespace CodeWalker.World
 
                     if (obj.Ped != null)
                     {
+                        // Set the ped name context so the eye debug log knows WHICH ped
+                        // this RenderPed call is for. Renderable.UpdateAnims (called
+                        // synchronously inside RenderPed → ... → RenderRenderable) reads
+                        // this static field in its BeginFrame header.
+                        try { EyeDebugLog.PedName = obj.Ped.Name ?? ""; }
+                        catch { EyeDebugLog.PedName = ""; }
+
                         renderer.RenderPed(obj.Ped);
                     }
                     if (obj.Prop != null)

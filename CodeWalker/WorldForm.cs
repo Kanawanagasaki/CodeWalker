@@ -403,6 +403,12 @@ namespace CodeWalker
 
             if (pauserendering) return;
 
+            // Clear eye-debug context at the start of each render frame so that
+            // non-cutscene renderables (world objects, vehicles, etc.) don't
+            // inherit stale cutscene/ped context from the previous frame.
+            // Cutscene.Render() will set fresh context if a cutscene is playing.
+            EyeDebugLog.ResetFrameContext();
+
             GameFileCache.BeginFrame();
 
             if (!Monitor.TryEnter(Renderer.RenderSyncRoot, 50))

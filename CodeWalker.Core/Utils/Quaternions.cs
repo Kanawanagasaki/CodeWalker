@@ -69,6 +69,34 @@ namespace CodeWalker
 
         public static Quaternion FastLerp(Quaternion a, Quaternion b, float v)
         {
+            // Shortest-path (neighborhood-preserving) nlerp.
+            //
+            // Quaternions have the double-cover property: q and -q represent the
+            // SAME rotation. RAGE animation keyframes (especially face/eye bones
+            // on tracks 1 and 26) frequently store adjacent keyframes on opposite
+            // hemispheres because the compression pipeline is sign-agnostic.
+            //
+            // Without this check, the linear blend vi*a + v*b interpolates
+            // THROUGH ZERO when dot(a, b) < 0, producing a near-zero quaternion
+            // that — after Normalize() — points in an essentially random
+            // direction. This is the root cause of "eyes looking in a different
+            // random direction every frame" in the Cutscene Viewer: each
+            // interpolated frame between two opposite-hemisphere keyframes
+            // yields a different garbage rotation.
+            //
+            // The fix mirrors what ExpressionVm.QuatSlerp already does:
+            // if the dot product is negative, negate b so we always lerp along
+            // the shorter arc on the quaternion sphere. nlerp with this sign
+            // fix is a perfectly good approximation to slerp at the small
+            // per-frame deltas typical in face animation, and stays cheap.
+            if ((a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W) < 0.0f)
+            {
+                b.X = -b.X;
+                b.Y = -b.Y;
+                b.Z = -b.Z;
+                b.W = -b.W;
+            }
+
             var r = new Quaternion();
             var vi = 1.0f - v;
             r.X = vi * a.X + v * b.X;

@@ -82,6 +82,15 @@ namespace CodeWalker.World
             //Name = pedname;
             NameHash = pedhash;
             InitData = initdata;
+            // Resolve Ped.Name from the hash so it's not always empty for cutscene peds.
+            // CutsceneForm.InitPed calls Ped.Init(MetaHash, GameFileCache) directly (not the
+            // string overload), so Name was never set. MetaHash.ToString() resolves via
+            // JenkIndex → MetaNames → GlobalText, which should find the ped model name
+            // since CodeWalker indexes all game strings during load.
+            if (string.IsNullOrEmpty(Name))
+            {
+                Name = pedhash.ToString();
+            }
             Ydd = gfc.GetYdd(pedhash);
             Ytd = gfc.GetYtd(pedhash);
             Ycd = gfc.GetYcd(ycdhash);

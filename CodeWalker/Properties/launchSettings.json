@@ -1,9 +1,12 @@
 {
-  "profiles": {
-    "CodeWalker": {
-      "commandName": "Project",
-      "commandLineArgs": "",
-      "workingDirectory": ".."
+    "profiles": {
+        "CodeWalker": {
+            "commandName": "Project",
+            "commandLineArgs": "",
+            "workingDirectory": "..",
+            "environmentVariables": {
+                
+            }
+        }
     }
-  }
 }
